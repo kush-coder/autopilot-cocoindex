@@ -1,0 +1,191 @@
+---
+title: CocoIndex *core concepts*
+description: >
+  Declare your outputs. CocoIndex applies changes and reuses cached results.
+---
+import Tabs from '../../../components/Tabs.astro';
+import PipelinePlayground from '../../../components/PipelinePlayground.astro';
+
+import AppOverview from '/src/components/diagrams/concepts/AppOverview.astro';
+import AppExample from '/src/components/diagrams/concepts/AppExample.astro';
+import ComponentPerFile from '/src/components/diagrams/concepts/ComponentPerFile.astro';
+import ComponentWithChunks from '/src/components/diagrams/concepts/ComponentWithChunks.astro';
+
+## Incremental processing
+
+Data and code change over time. Incremental processing reruns affected work and updates targets, such as a search database.
+
+Manual implementations must track changes and preserve intermediate results.
+They must also manage inserts, updates, deletes, schema changes, and backfills.
+
+## State-driven programming
+
+Declare the target state you want from the current source data.
+CocoIndex computes and applies the changes needed to match it.
+
+**TargetState = Transform(SourceState)**
+
+The target state is a pure function of the source state, with no other side effects.
+Transformations read sources and produce target data, such as database rows or files.
+
+<details>
+<summary>Compare familiar programming models</summary>
+
+- **React:** Declare UI from state. React updates the UI when state changes.
+- **Spreadsheets:** Declare formulas. Upstream changes recompute dependent cells.
+- **Materialized views:** Declare a query. Source changes refresh the view.
+
+</details>
+
+## App
+
+An **app** is CocoIndex's top-level executable. It reads sources, transforms data, and declares target states.
+CocoIndex synchronizes those target states with external systems, such as Postgres or a vector database.
+
+<AppOverview />
+
+For example, here's an app that reads PDFs from a drive, converts them to markdown, and outputs to a folder:
+
+<AppExample />
+
+## Processing component
+
+A **processing component** owns the work and target states for one source item.
+It runs independently. When it finishes, CocoIndex applies its target states without waiting for other components.
+
+For example, if you have many files in a drive and want to process them file by file, your processing component would operate at the file level:
+
+<ComponentPerFile />
+
+One file can produce several target states, such as one embedding vector per text chunk.
+CocoIndex batches the inserts, updates, and deletes for each file after processing completes.
+Each target backend applies its batch atomically when supported, such as within a database transaction:
+
+<ComponentWithChunks />
+
+These examples show how target states change:
+
+<Tabs labels={["Add a file", "Update a file", "Delete a file"]}>
+  <Fragment slot="tab-0">
+    <ComponentWithChunks scenario={{ rows: [
+      { file: 'a.md', chunks: [
+        { label: 'chunk1', vectorLabel: 'vector1' },
+        { label: 'chunk2', vectorLabel: 'vector2' },
+      ] },
+      { file: 'b.md', chunks: [
+        { label: 'chunk3', vectorLabel: 'vector3' },
+        { label: 'chunk4', vectorLabel: 'vector4' },
+      ] },
+      { file: 'c.md', fileState: 'new', pcState: 'new', splitState: 'new', chunks: [
+        { label: 'chunk5', vectorLabel: 'vector5', state: 'new' },
+        { label: 'chunk6', vectorLabel: 'vector6', state: 'new' },
+      ] },
+    ]}} />
+
+    Adding `c.md` creates a processing component for it. After processing completes, CocoIndex inserts `vector5` and `vector6`.
+  </Fragment>
+  <Fragment slot="tab-1">
+    <ComponentWithChunks scenario={{ rows: [
+      { file: 'a.md', chunks: [
+        { label: 'chunk1', vectorLabel: 'vector1' },
+        { label: 'chunk2', vectorLabel: 'vector2' },
+      ] },
+      { file: 'b.md', fileState: 'updated', pcState: 'updated', splitState: 'updated', chunks: [
+        { label: 'chunk3', vectorLabel: 'vector3', state: 'removed' },
+        { label: 'chunk4', vectorLabel: 'vector4', state: 'removed' },
+        { label: 'chunk5', vectorLabel: 'vector5', state: 'new' },
+      ] },
+    ]}} />
+
+    Updating `b.md` reduces its content to one chunk.
+    Its target states change from `vector3` and `vector4` to `vector5`.
+    CocoIndex deletes the old rows and inserts the new row in one transaction.
+  </Fragment>
+  <Fragment slot="tab-2">
+    <ComponentWithChunks scenario={{ rows: [
+      { file: 'a.md', chunks: [
+        { label: 'chunk1', vectorLabel: 'vector1' },
+        { label: 'chunk2', vectorLabel: 'vector2' },
+      ] },
+      { file: 'b.md', fileState: 'removed', pcState: 'removed', splitState: 'removed', chunks: [
+        { label: 'chunk3', vectorLabel: 'vector3', state: 'removed' },
+        { label: 'chunk4', vectorLabel: 'vector4', state: 'removed' },
+      ] },
+    ]}} />
+
+    Deleting `b.md` removes its associated target states, `vector3` and `vector4`, in one transaction.
+  </Fragment>
+</Tabs>
+
+## Function memoization: skip unchanged computations
+
+A **memoized function** reuses its previous result when its inputs and code remain unchanged.
+Both processing components and transforms are functions, so you can memoize either level:
+
+- **Processing component:** Skip the whole file when its content and processing logic remain unchanged.
+- **Transform:** Reuse an embedding when its text and embedding logic, including the model, remain unchanged.
+
+See [Function Memoization](./function#memoization) for more details.
+
+<ComponentWithChunks memoized={true} />
+
+Here's how memoization behaves in different scenarios:
+
+<Tabs labels={["Change input", "Change code"]}>
+  <Fragment slot="tab-0">
+    <ComponentWithChunks memoized={true} scenario={{ rows: [
+      { file: 'a.md', pcStatus: 'cache-ready', chunks: [
+        { label: 'chunk1', vectorLabel: 'vector1', embedStatus: 'cache-ready' },
+        { label: 'chunk2', vectorLabel: 'vector2', embedStatus: 'cache-ready' },
+      ] },
+      { file: 'b.md', fileState: 'updated', pcStatus: 'refreshing', pcState: 'updated', splitState: 'updated', chunks: [
+        { label: 'chunk3', vectorLabel: 'vector3', embedStatus: 'cache-ready' },
+        { label: 'chunk4', vectorLabel: 'vector4', state: 'removed' },
+        { label: 'chunk5', vectorLabel: 'vector5', state: 'new' },
+      ] },
+    ]}} />
+
+    When `b.md` changes:
+
+    - `a.md` and its processing component remain cached.
+    - `b.md` runs again and produces `chunk3` and `chunk5`.
+    - `Embed(chunk3)` reuses its cached result. `Embed(chunk5)` requires a new computation.
+  </Fragment>
+  <Fragment slot="tab-1">
+    <ComponentWithChunks memoized={true} scenario={{ rows: [
+      { file: 'a.md', pcStatus: 'refreshing', pcState: 'updated', splitState: 'updated', chunks: [
+        { label: 'chunk1', vectorLabel: 'vector1', embedStatus: 'cache-ready' },
+        { label: 'chunk2', vectorLabel: 'vector2', embedStatus: 'cache-ready' },
+      ] },
+      { file: 'b.md', pcStatus: 'refreshing', pcState: 'updated', splitState: 'updated', chunks: [
+        { label: 'chunk3', vectorLabel: 'vector3', state: 'removed' },
+        { label: 'chunk4', vectorLabel: 'vector4', state: 'removed' },
+        { label: 'chunk5', vectorLabel: 'vector5', state: 'new' },
+        { label: 'chunk6', vectorLabel: 'vector6', state: 'new' },
+      ] },
+    ]}} />
+
+    When the "Split into chunks" logic changes:
+
+    - Both processing components run again.
+    - `a.md` produces the same chunks, so its `Embed` results are reused.
+    - `b.md` produces `chunk5` and `chunk6`, which require new `Embed` computations.
+
+    A code change can still reuse downstream results when their inputs and function logic remain unchanged.
+  </Fragment>
+</Tabs>
+
+## Try incremental processing
+
+Edit a file and compare the updated row with the cached work. This example uses simulated data.
+
+<PipelinePlayground />
+
+## Next steps
+
+Use the Programming Guide to apply these concepts in code:
+
+- [App](./app) — creating and running pipelines
+- [Target State](./target_state) — declaring what should exist in external systems
+- [Processing Component](./processing_component) — structuring work and mounting components
+- [Function](./function) — <Lang only="python">the `@coco.fn` decorator</Lang><Lang only="rust">the `#[cocoindex::function]` attribute</Lang>, memoization, and change detection

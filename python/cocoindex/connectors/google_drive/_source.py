@@ -1,0 +1,355 @@
+"""Google Drive source utilities.
+
+This module provides a read-only API for ingesting files from Google Drive,
+authenticated with a service account or with a personal account signed in
+through OAuth (``UserAccount``, experimental). Change notifications will be
+added later.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import PurePath
+from typing import Any, AsyncIterator, Iterator, Sequence, Self
+
+from cocoindex._internal.extras import install_hint
+
+try:
+    import httplib2  # type: ignore
+    from google.oauth2.service_account import Credentials  # type: ignore
+    from google_auth_httplib2 import AuthorizedHttp  # type: ignore
+    from googleapiclient.discovery import build  # type: ignore
+    from googleapiclient.http import HttpRequest  # type: ignore
+except ImportError as e:
+    raise ImportError(
+        "google-auth and google-api-python-client are required to use the Google Drive source. "
+        + install_hint("google_drive")
+    ) from e
+
+from cocoindex.resources import file
+
+from ._oauth import UserAccount
+
+
+class DriveFilePath(file.FilePath[str]):
+    """
+    File path for Google Drive files.
+
+    The resolved path is the Google Drive file ID (string).
+    """
+
+    __slots__ = ("_file_id",)
+
+    _file_id: str
+
+    def __init__(
+        self,
+        path: str | PurePath,
+        *,
+        file_id: str,
+    ) -> None:
+        super().__init__(
+            None,
+            PurePath(path),
+        )
+        self._file_id = file_id
+
+    def resolve(self) -> str:
+        """Return the Google Drive file ID."""
+        return self._file_id
+
+    def _with_path(self, path: PurePath) -> Self:
+        """Create a new DriveFilePath with the given path."""
+        return type(self)(path, file_id=self._file_id)  # type: ignore[return-value]
+
+    def __coco_memo_key__(self) -> object:
+        return (self._file_id, self._path)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DriveFilePath):
+            return False
+        return (self._file_id, self._path) == (other._file_id, other._path)
+
+    def __hash__(self) -> int:
+        return hash((self._file_id, self._path))
+
+    def __lt__(self, other: Self) -> bool:
+        if not isinstance(other, DriveFilePath):
+            return NotImplemented
+        return (self._path, self._file_id) < (other._path, other._file_id)
+
+
+_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
+# Attempts after the first for every Drive API request. googleapiclient retries
+# a 5xx, a 429 and a 403 whose reason is a rate limit, with randomized
+# exponential backoff; Drive's usage-limits guide asks clients to do exactly that.
+_RETRIES = 5
+_FOLDER_MIME = "application/vnd.google-apps.folder"
+_DOCS_MIME = "application/vnd.google-apps.document"
+_SHEETS_MIME = "application/vnd.google-apps.spreadsheet"
+_SLIDES_MIME = "application/vnd.google-apps.presentation"
+
+_EXPORT_MIME_BY_TYPE = {
+    _DOCS_MIME: "text/markdown",
+    _SHEETS_MIME: "text/csv",
+    _SLIDES_MIME: "text/plain",
+}
+
+
+@dataclass
+class DriveFileInfo:
+    file_id: str
+    name: str
+    mime_type: str
+    size: int
+    modified_time: datetime
+    path: str | None = None
+    md5_checksum: str | None = None
+
+
+class DriveFile(file.FileLike[str]):
+    """Represents a file entry from Google Drive."""
+
+    _service: Any
+    _info: DriveFileInfo
+
+    def __init__(self, service: Any, info: DriveFileInfo) -> None:
+        file_path = DriveFilePath(
+            info.path if info.path is not None else info.name, file_id=info.file_id
+        )
+        metadata = file.FileMetadata(
+            size=info.size,
+            modified_time=info.modified_time,
+            content_fingerprint=_md5_to_fingerprint(info.md5_checksum),
+        )
+        super().__init__(file_path, _metadata=metadata)
+        self._service = service
+        self._info = info
+
+    @property
+    def info(self) -> DriveFileInfo:
+        """What the listing said about the file: id, name, MIME type, size, modified time, MD5."""
+        return self._info
+
+    async def _fetch_metadata(self) -> file.FileMetadata:
+        """Fetch metadata from the Google Drive API."""
+
+        def _fetch() -> file.FileMetadata:
+            response = (
+                self._service.files()
+                .get(
+                    fileId=self._info.file_id,
+                    fields="size, modifiedTime, md5Checksum",
+                )
+                .execute(num_retries=_RETRIES)
+            )
+            size_raw = response.get("size")
+            size = int(size_raw) if size_raw is not None else 0
+            return file.FileMetadata(
+                size=size,
+                modified_time=_parse_modified_time(response.get("modifiedTime")),
+                content_fingerprint=_md5_to_fingerprint(response.get("md5Checksum")),
+            )
+
+        return await asyncio.to_thread(_fetch)
+
+    def _read_sync(self, size: int = -1) -> bytes:
+        """Synchronously read file content (internal helper)."""
+        if size != -1:
+            raise ValueError("Partial reads are not supported for Google Drive files.")
+
+        file_id = self._info.file_id
+        if self._info.mime_type in _EXPORT_MIME_BY_TYPE:
+            export_mime = _EXPORT_MIME_BY_TYPE[self._info.mime_type]
+            request = self._service.files().export_media(
+                fileId=file_id, mimeType=export_mime
+            )
+        else:
+            request = self._service.files().get_media(fileId=file_id)
+        content: bytes = request.execute(num_retries=_RETRIES)
+        return content
+
+    async def _read_impl(self, size: int = -1) -> bytes:
+        """Read file content via Google Drive API in a thread pool."""
+        return await asyncio.to_thread(self._read_sync, size)
+
+
+@dataclass
+class GoogleDriveSourceSpec:
+    """Specification for a Google Drive source.
+
+    Authenticates with exactly one of ``service_account_credential_path`` and
+    ``user_account`` (a personal account signed in through OAuth; experimental).
+    """
+
+    service_account_credential_path: str | None
+    root_folder_ids: Sequence[str]
+    mime_types: Sequence[str] | None = None
+    user_account: UserAccount | None = None
+
+    def __post_init__(self) -> None:
+        if (self.service_account_credential_path is None) == (
+            self.user_account is None
+        ):
+            raise ValueError(
+                "GoogleDriveSourceSpec needs exactly one of "
+                "service_account_credential_path and user_account"
+            )
+
+
+def _credentials(spec: GoogleDriveSourceSpec) -> Any:
+    if spec.user_account is not None:
+        return spec.user_account._credentials()
+    return Credentials.from_service_account_file(  # type: ignore[no-untyped-call]
+        spec.service_account_credential_path,
+        scopes=[_DRIVE_SCOPE],
+    )
+
+
+def _build_service(spec: GoogleDriveSourceSpec) -> Any:
+    creds = _credentials(spec)
+
+    # googleapiclient is built on httplib2, which is *not* thread-safe.
+    # The default service shares one Http (and one socket) across all
+    # requests, so concurrent downloads stall waiting on each other and
+    # eventually trip the 60s read timeout. Hand each request its own
+    # AuthorizedHttp so reads dispatched from different threads don't race.
+    def _request_builder(_http: Any, *args: Any, **kwargs: Any) -> Any:
+        return HttpRequest(AuthorizedHttp(creds, http=httplib2.Http()), *args, **kwargs)
+
+    return build(
+        "drive",
+        "v3",
+        credentials=creds,
+        requestBuilder=_request_builder,
+        cache_discovery=False,
+    )
+
+
+def _parse_modified_time(value: str | None) -> datetime:
+    if not value:
+        return datetime.fromtimestamp(0)
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _md5_to_fingerprint(md5_checksum: str | None) -> bytes | None:
+    """Drive gives an MD5 for binary files only, not for Google Docs, Sheets or Slides."""
+    return md5_checksum.encode("utf-8") if md5_checksum else None
+
+
+def _list_children(service: Any, folder_id: str) -> list[DriveFileInfo]:
+    query = f"'{folder_id}' in parents and trashed = false"
+    page_token = None
+    results: list[DriveFileInfo] = []
+    while True:
+        response = (
+            service.files()
+            .list(
+                q=query,
+                fields=(
+                    "nextPageToken,"
+                    " files(id, name, mimeType, size, modifiedTime, md5Checksum)"
+                ),
+                pageToken=page_token,
+            )
+            .execute(num_retries=_RETRIES)
+        )
+        for f in response.get("files", []):
+            size_raw = f.get("size")
+            size = int(size_raw) if size_raw is not None else 0
+            results.append(
+                DriveFileInfo(
+                    file_id=f["id"],
+                    name=f["name"],
+                    mime_type=f["mimeType"],
+                    size=size,
+                    modified_time=_parse_modified_time(f.get("modifiedTime")),
+                    md5_checksum=f.get("md5Checksum"),
+                )
+            )
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return results
+
+
+def list_files(spec: GoogleDriveSourceSpec) -> Iterator[DriveFile]:
+    """List files under the given root folders (recursively)."""
+    service = _build_service(spec)
+    folders = deque((folder_id, "") for folder_id in spec.root_folder_ids)
+    seen_folders: set[str] = set()
+    seen_files: set[str] = set()
+
+    while folders:
+        folder_id, prefix = folders.popleft()
+        if folder_id in seen_folders:
+            continue
+        seen_folders.add(folder_id)
+        # Drive lists children in no set order. Sorting them makes the path kept
+        # for a file with several parents (the first one seen) the same every run.
+        children = sorted(
+            _list_children(service, folder_id),
+            key=lambda info: (info.name, info.file_id),
+        )
+        for info in children:
+            path = f"{prefix}/{info.name}" if prefix else info.name
+            if info.mime_type == _FOLDER_MIME:
+                folders.append((info.file_id, path))
+                continue
+            if spec.mime_types and info.mime_type not in spec.mime_types:
+                continue
+            if info.file_id in seen_files:
+                continue
+            seen_files.add(info.file_id)
+            yield DriveFile(service, replace(info, path=path))
+
+
+class GoogleDriveSource:
+    """Source wrapper for Google Drive files.
+
+    Authenticates with a service account (``service_account_credential_path``)
+    or with a personal account signed in through OAuth (``user_account``,
+    experimental); exactly one of the two.
+    """
+
+    def __init__(
+        self,
+        *,
+        root_folder_ids: Sequence[str],
+        service_account_credential_path: str | None = None,
+        user_account: UserAccount | None = None,
+        mime_types: Sequence[str] | None = None,
+    ) -> None:
+        self._spec = GoogleDriveSourceSpec(
+            service_account_credential_path=service_account_credential_path,
+            root_folder_ids=root_folder_ids,
+            mime_types=mime_types,
+            user_account=user_account,
+        )
+
+    async def files(self) -> AsyncIterator[DriveFile]:
+        """Async iterate over Google Drive files."""
+        from cocoindex.connectorkits.async_adapters import sync_to_async_iter
+
+        async for f in sync_to_async_iter(lambda: list_files(self._spec)):
+            yield f
+
+    async def items(self) -> AsyncIterator[tuple[str, DriveFile]]:
+        """Async iterate as (key, file) pairs for use with mount_each().
+
+        The key is the file's stable Google Drive ID, since names are not unique.
+        """
+        async for f in self.files():
+            yield (f.file_path.resolve(), f)
+
+
+__all__ = [
+    "DriveFile",
+    "DriveFileInfo",
+    "GoogleDriveSource",
+    "GoogleDriveSourceSpec",
+    "list_files",
+]

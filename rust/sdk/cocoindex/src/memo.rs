@@ -1,0 +1,1615 @@
+//! Memoization: skip re-execution when inputs haven't changed.
+//!
+//! Prefer `#[cocoindex::function(memo)]` for memoizing a whole pipeline
+//! function. The attribute builds the argument key, tracks the function body's
+//! logic, and passes the memo-scoped [`Ctx`] into the body as `&Ctx`. Context
+//! resources can therefore be read normally with [`Ctx::get_or_err`] or
+//! [`Ctx::get_key`]. Use `memo_key(parameter = skip)` for a `Clone` parameter
+//! that should not participate in the key; it does not need to implement
+//! [`MemoInput`] or Serde. A transform override similarly replaces the
+//! parameter's normal [`MemoInput`] identity and suppresses its type-owned
+//! external-state validation.
+//!
+//! `MemoInput` composes recursively through `Option`, sequences, tuples,
+//! maps, sets, `Box`, and `Arc`. The SDK also implements it for its standard
+//! scalar schema types, including UUIDs and, when their corresponding SDK
+//! features are enabled, `serde_json::Value`, Chrono values, and
+//! `rust_decimal::Decimal`.
+//! Other third-party types need a local newtype or a declaration/call-site
+//! `memo_key` projection because Rust's orphan rules prevent downstream crates
+//! from implementing this trait for a foreign type.
+//!
+//! `Vec<u8>` uses the same recursive sequence representation as every other
+//! `Vec<T>`. For large byte payloads, prefer [`bytes::Bytes`] for bulk hashing,
+//! or pass a precomputed [`Fingerprint`] when the content is already hashed.
+//!
+//! [`Ctx::memo`] and [`cached`] are intended for block-level memoization inside
+//! a function. Their closure body is not logic-tracked. When a manual memo block
+//! must invalidate after its enclosing `#[cocoindex::function]` changes, include
+//! that function's generated `__COCO_FN_HASH_<NAME>` constant in the manual key.
+//!
+//! Dependencies beyond the arguments are declared with `deps = ...` on the
+//! attribute (a value every call depends on), [`Ctx::use_logic_dep`] (a value
+//! decided per call) and [`Ctx::use_data_dep`] (data the body reads while it
+//! runs); see [`crate::deps`].
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::future::Future;
+use std::hash::{BuildHasher, Hash};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use cocoindex_core::engine::context::{
+    ComponentProcessorContext, FnCallContext, MemoStatesPayload,
+};
+use cocoindex_core::engine::function::{FnCallMemoGuard, reserve_memoization};
+use cocoindex_utils::fingerprint::{Fingerprint, Fingerprinter};
+use serde::{Deserialize, Serialize};
+
+use crate::ctx::{Ctx, FnFrameGuard};
+use crate::deps::validate_data_deps;
+use crate::error::{Error, Result};
+use crate::profile::{RustProfile, Value};
+use crate::resources::file::FileLike;
+
+/// Type-owned memoization behavior for function arguments and tracked context
+/// values.
+///
+/// Use the [`crate::MemoInput`] derive for normal structs and enums. It adds a
+/// `MemoInput` bound to each field type and recursively visits every field; the
+/// containing type itself does not need to implement [`Serialize`]. Nested
+/// resources therefore preserve their type-owned identity and freshness
+/// validation. Resource types can implement this trait directly to provide a
+/// small stable identity and asynchronous validation.
+#[async_trait]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as a memoized input",
+    note = "add `#[derive(cocoindex::MemoInput)]`, implement `MemoInput` manually, or provide a `memo_key` override"
+)]
+pub trait MemoInput: Send + Sync {
+    /// Add this value's semantic identity to a function memo key.
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()>;
+
+    /// Whether [`memo_state`](Self::memo_state) may return `Some` for this
+    /// value. `true` by default, so a type that implements `memo_state` need
+    /// not implement this; a type whose `memo_state` is always `None` (every
+    /// plain data type) returns `false` here, and the SDK then skips the
+    /// `memo_state` call and its boxed future on every memoized call.
+    ///
+    /// A container returns whether any of its elements does: see the
+    /// [`crate::MemoInput`] derive.
+    fn has_memo_state(&self) -> bool {
+        true
+    }
+
+    /// Validate external state before a matching memo is reused.
+    ///
+    /// `None` means that this value needs no state validation. Called only
+    /// when [`has_memo_state`](Self::has_memo_state) is `true`.
+    async fn memo_state(
+        &self,
+        _previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        Ok(None)
+    }
+}
+
+macro_rules! impl_serde_memo_input {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            #[async_trait]
+            impl MemoInput for $ty {
+                fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+                    writer.write(self)
+                }
+
+                fn has_memo_state(&self) -> bool {
+                    false
+                }
+            }
+        )+
+    };
+}
+
+impl_serde_memo_input!(
+    (),
+    bool,
+    char,
+    i8,
+    i16,
+    i32,
+    i64,
+    i128,
+    isize,
+    u8,
+    u16,
+    u32,
+    u64,
+    u128,
+    usize,
+    f32,
+    f64,
+    String,
+    str,
+    PathBuf,
+    Path,
+    Duration,
+    SystemTime,
+    uuid::Uuid,
+    Fingerprint,
+);
+
+#[async_trait]
+impl MemoInput for bytes::Bytes {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        writer.write(self)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        false
+    }
+}
+
+impl_serde_memo_input!(serde_json::Value);
+
+#[cfg(feature = "chrono")]
+impl_serde_memo_input!(chrono::NaiveDate, chrono::NaiveTime, chrono::NaiveDateTime);
+
+#[cfg(feature = "chrono")]
+#[async_trait]
+impl<Tz> MemoInput for chrono::DateTime<Tz>
+where
+    Tz: chrono::TimeZone + Send + Sync,
+    Tz::Offset: Send + Sync,
+    chrono::DateTime<Tz>: Serialize,
+{
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        writer.write(self)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "rust_decimal")]
+impl_serde_memo_input!(rust_decimal::Decimal);
+
+#[async_trait]
+impl<T: MemoInput + ?Sized> MemoInput for &T {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        (*self).write_memo_key(writer)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        (*self).has_memo_state()
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        (*self).memo_state(previous).await
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput + ?Sized> MemoInput for Box<T> {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        self.as_ref().write_memo_key(writer)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.as_ref().has_memo_state()
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        self.as_ref().memo_state(previous).await
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput + ?Sized> MemoInput for Arc<T> {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        self.as_ref().write_memo_key(writer)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.as_ref().has_memo_state()
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        self.as_ref().memo_state(previous).await
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput> MemoInput for Option<T> {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        match self {
+            Some(value) => {
+                writer.write(&("option", true))?;
+                writer.write_input(value)
+            }
+            None => writer.write(&("option", false)),
+        }
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.as_ref().is_some_and(MemoInput::has_memo_state)
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        match self {
+            Some(value) => value.memo_state(previous).await,
+            None => Ok(None),
+        }
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput> MemoInput for [T] {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        writer.write(&("sequence", self.len()))?;
+        for item in self {
+            writer.write_input(item)?;
+        }
+        Ok(())
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.iter().any(MemoInput::has_memo_state)
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        let children = self
+            .iter()
+            .map(|item| item as &dyn MemoInput)
+            .collect::<Vec<_>>();
+        memo_state_group(&children, previous, false).await
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput> MemoInput for Vec<T> {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        self.as_slice().write_memo_key(writer)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.as_slice().has_memo_state()
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        self.as_slice().memo_state(previous).await
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput, const N: usize> MemoInput for [T; N] {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        self.as_slice().write_memo_key(writer)
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.as_slice().has_memo_state()
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        self.as_slice().memo_state(previous).await
+    }
+}
+
+pub(crate) fn memo_value_fingerprint<T: MemoInput + ?Sized>(value: &T) -> Result<Fingerprint> {
+    let mut fingerprinter = Fingerprinter::default();
+    value.write_memo_key(&mut MemoKeyWriter {
+        fingerprinter: &mut fingerprinter,
+    })?;
+    Ok(fingerprinter.into_fingerprint())
+}
+
+type SortedMapEntries<'a, K, V> = (Vec<(Fingerprint, Fingerprint, &'a K, &'a V)>, bool);
+
+fn sorted_map_entries<'a, K, V>(
+    entries: impl Iterator<Item = (&'a K, &'a V)>,
+) -> Result<SortedMapEntries<'a, K, V>>
+where
+    K: MemoInput + 'a,
+    V: MemoInput + 'a,
+{
+    let mut entries = entries
+        .map(|(key, value)| {
+            Ok((
+                memo_value_fingerprint(key)?,
+                memo_value_fingerprint(value)?,
+                key,
+                value,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by_key(|(key_fp, value_fp, _, _)| (*key_fp, *value_fp));
+    let collision = entries.windows(2).any(|pair| pair[0].0 == pair[1].0);
+    Ok((entries, collision))
+}
+
+macro_rules! impl_map_memo_input {
+    ($ty:ty) => {
+        #[async_trait]
+        impl<K, V, S> MemoInput for $ty
+        where
+            K: MemoInput + Eq + Hash,
+            V: MemoInput,
+            S: BuildHasher + Send + Sync,
+        {
+            fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+                let (entries, collision) = sorted_map_entries(self.iter())?;
+                writer.write(&("map", entries.len(), collision))?;
+                for (_, _, key, value) in entries {
+                    writer.write_input(key)?;
+                    writer.write_input(value)?;
+                }
+                Ok(())
+            }
+
+            fn has_memo_state(&self) -> bool {
+                self.iter()
+                    .any(|(key, value)| key.has_memo_state() || value.has_memo_state())
+            }
+
+            async fn memo_state(
+                &self,
+                previous: Option<&MemoStateValue>,
+            ) -> Result<Option<MemoStateDecision>> {
+                let (entries, collision) = sorted_map_entries(self.iter())?;
+                let children = entries
+                    .iter()
+                    .flat_map(|(_, _, key, value)| {
+                        [*key as &dyn MemoInput, *value as &dyn MemoInput]
+                    })
+                    .collect::<Vec<_>>();
+                memo_state_group(&children, previous, collision).await
+            }
+        }
+    };
+}
+
+impl_map_memo_input!(HashMap<K, V, S>);
+
+#[async_trait]
+impl<K: MemoInput + Ord, V: MemoInput> MemoInput for BTreeMap<K, V> {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        let (entries, collision) = sorted_map_entries(self.iter())?;
+        writer.write(&("map", entries.len(), collision))?;
+        for (_, _, key, value) in entries {
+            writer.write_input(key)?;
+            writer.write_input(value)?;
+        }
+        Ok(())
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.iter()
+            .any(|(key, value)| key.has_memo_state() || value.has_memo_state())
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        let (entries, collision) = sorted_map_entries(self.iter())?;
+        let children = entries
+            .iter()
+            .flat_map(|(_, _, key, value)| [*key as &dyn MemoInput, *value as &dyn MemoInput])
+            .collect::<Vec<_>>();
+        memo_state_group(&children, previous, collision).await
+    }
+}
+
+fn sorted_set_entries<'a, T: MemoInput + 'a>(
+    entries: impl Iterator<Item = &'a T>,
+) -> Result<(Vec<(Fingerprint, &'a T)>, bool)> {
+    let mut entries = entries
+        .map(|value| Ok((memo_value_fingerprint(value)?, value)))
+        .collect::<Result<Vec<_>>>()?;
+    entries.sort_by_key(|(fingerprint, _)| *fingerprint);
+    let collision = entries.windows(2).any(|pair| pair[0].0 == pair[1].0);
+    Ok((entries, collision))
+}
+
+#[async_trait]
+impl<T, S> MemoInput for HashSet<T, S>
+where
+    T: MemoInput + Eq + Hash,
+    S: BuildHasher + Send + Sync,
+{
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        let (entries, collision) = sorted_set_entries(self.iter())?;
+        writer.write(&("set", entries.len(), collision))?;
+        for (_, value) in entries {
+            writer.write_input(value)?;
+        }
+        Ok(())
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.iter().any(MemoInput::has_memo_state)
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        let (entries, collision) = sorted_set_entries(self.iter())?;
+        let children = entries
+            .iter()
+            .map(|(_, value)| *value as &dyn MemoInput)
+            .collect::<Vec<_>>();
+        memo_state_group(&children, previous, collision).await
+    }
+}
+
+#[async_trait]
+impl<T: MemoInput + Ord> MemoInput for BTreeSet<T> {
+    fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+        let (entries, collision) = sorted_set_entries(self.iter())?;
+        writer.write(&("set", entries.len(), collision))?;
+        for (_, value) in entries {
+            writer.write_input(value)?;
+        }
+        Ok(())
+    }
+
+    fn has_memo_state(&self) -> bool {
+        self.iter().any(MemoInput::has_memo_state)
+    }
+
+    async fn memo_state(
+        &self,
+        previous: Option<&MemoStateValue>,
+    ) -> Result<Option<MemoStateDecision>> {
+        let (entries, collision) = sorted_set_entries(self.iter())?;
+        let children = entries
+            .iter()
+            .map(|(_, value)| *value as &dyn MemoInput)
+            .collect::<Vec<_>>();
+        memo_state_group(&children, previous, collision).await
+    }
+}
+
+macro_rules! impl_tuple_memo_input {
+    ($len:expr; $(($index:tt, $name:ident)),+ $(,)?) => {
+        #[async_trait]
+        impl<$($name: MemoInput),+> MemoInput for ($($name,)+) {
+            fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+                writer.write(&("tuple", $len as usize))?;
+                $(writer.write_input(&self.$index)?;)+
+                Ok(())
+            }
+
+            fn has_memo_state(&self) -> bool {
+                $(self.$index.has_memo_state())||+
+            }
+
+            async fn memo_state(
+                &self,
+                previous: Option<&MemoStateValue>,
+            ) -> Result<Option<MemoStateDecision>> {
+                let children: &[&dyn MemoInput] = &[$(&self.$index),+];
+                memo_state_group(children, previous, false).await
+            }
+        }
+    };
+}
+
+impl_tuple_memo_input!(1; (0, A));
+impl_tuple_memo_input!(2; (0, A), (1, B));
+impl_tuple_memo_input!(3; (0, A), (1, B), (2, C));
+impl_tuple_memo_input!(4; (0, A), (1, B), (2, C), (3, D));
+impl_tuple_memo_input!(5; (0, A), (1, B), (2, C), (3, D), (4, E));
+impl_tuple_memo_input!(6; (0, A), (1, B), (2, C), (3, D), (4, E), (5, F));
+impl_tuple_memo_input!(7; (0, A), (1, B), (2, C), (3, D), (4, E), (5, F), (6, G));
+impl_tuple_memo_input!(8; (0, A), (1, B), (2, C), (3, D), (4, E), (5, F), (6, G), (7, H));
+
+/// Opaque writer passed to [`MemoInput::write_memo_key`].
+pub struct MemoKeyWriter<'a> {
+    fingerprinter: &'a mut Fingerprinter,
+}
+
+impl MemoKeyWriter<'_> {
+    /// Write a serializable value as one framed part of the memo identity.
+    pub fn write<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<()> {
+        write_key_fingerprint_part(self.fingerprinter, value)
+    }
+
+    /// Recursively write another memo input into the same framed fingerprint
+    /// stream.
+    pub fn write_input<T: MemoInput + ?Sized>(&mut self, value: &T) -> Result<()> {
+        value.write_memo_key(self)
+    }
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct MemoStateValue(Value);
+
+#[doc(hidden)]
+pub struct MemoStateDecision {
+    state: MemoStateValue,
+    memo_valid: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct NestedMemoStatesV1 {
+    version: u8,
+    children: Vec<Option<Vec<u8>>>,
+}
+
+impl MemoStateValue {
+    /// Serialize a state value for storage with a memo entry.
+    pub fn from_serializable<T: Serialize>(value: &T) -> Result<Self> {
+        Ok(Self(Value::from_serializable(value)?))
+    }
+
+    /// Deserialize a state stored by a previous memo run.
+    pub fn deserialize<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
+        self.0.deserialize()
+    }
+
+    pub(crate) fn from_profile_value(value: Value) -> Self {
+        Self(value)
+    }
+}
+
+impl MemoStateDecision {
+    /// Build a state-validation decision.
+    pub fn new<T: Serialize>(state: &T, memo_valid: bool) -> Result<Self> {
+        Ok(Self {
+            state: MemoStateValue::from_serializable(state)?,
+            memo_valid,
+        })
+    }
+
+    pub(crate) fn into_parts(self) -> (Value, bool) {
+        (self.state.0, self.memo_valid)
+    }
+}
+
+/// Validate the memo states of recursively nested inputs and bundle them into
+/// one opaque state value for the containing top-level argument or context
+/// value.
+#[doc(hidden)]
+pub async fn memo_state_group(
+    children: &[&dyn MemoInput],
+    previous: Option<&MemoStateValue>,
+    force_miss: bool,
+) -> Result<Option<MemoStateDecision>> {
+    let previous_group = previous
+        .and_then(|value| value.deserialize::<NestedMemoStatesV1>().ok())
+        .filter(|group| group.version == 1);
+    let shape_matches = previous_group
+        .as_ref()
+        .is_some_and(|group| group.children.len() == children.len());
+
+    let previous_values = (0..children.len())
+        .map(|index| {
+            previous_group
+                .as_ref()
+                .and_then(|group| group.children.get(index))
+                .and_then(|state| state.as_ref())
+                .map(|bytes| MemoStateValue(Value(bytes::Bytes::copy_from_slice(bytes.as_slice()))))
+        })
+        .collect::<Vec<_>>();
+
+    let decisions = futures::future::try_join_all(children.iter().zip(&previous_values).map(
+        |(child, previous)| async move {
+            if child.has_memo_state() {
+                child.memo_state(previous.as_ref()).await
+            } else {
+                Ok(None)
+            }
+        },
+    ))
+    .await?;
+
+    let mut memo_valid = previous.is_some() && shape_matches && !force_miss;
+    // Preserve a marker after malformed/legacy state so this slot forces one
+    // miss without shifting the following top-level argument states.
+    let mut has_state = force_miss || previous.is_some();
+    let mut new_children = Vec::with_capacity(decisions.len());
+    for (index, decision) in decisions.into_iter().enumerate() {
+        let previous_present = previous_values[index].is_some();
+        match decision {
+            Some(decision) => {
+                has_state = true;
+                memo_valid &= previous_present && decision.memo_valid;
+                new_children.push(Some(decision.state.0.0.to_vec()));
+            }
+            None => {
+                memo_valid &= !previous_present;
+                new_children.push(None);
+            }
+        }
+    }
+
+    if !has_state {
+        return Ok(None);
+    }
+
+    MemoStateDecision::new(
+        &NestedMemoStatesV1 {
+            version: 1,
+            children: new_children,
+        },
+        memo_valid,
+    )
+    .map(Some)
+}
+
+/// Collect the memo states of a mounted component's arguments, validating
+/// them against the states stored with its memo entry (`None` on a miss).
+///
+/// States are positional: an argument whose `memo_state` is `None` takes no
+/// slot, exactly like `#[function(memo)]` argument states. Returns the new
+/// states and whether every stored state is still valid.
+pub(crate) async fn collect_component_states(
+    inputs: &[Arc<dyn MemoInput>],
+    stored: Option<&[Value]>,
+) -> Result<(Vec<Value>, bool)> {
+    let mut states = Vec::new();
+    let mut memo_valid = true;
+    for input in inputs {
+        if !input.has_memo_state() {
+            continue;
+        }
+        let previous = stored
+            .and_then(|stored| stored.get(states.len()))
+            .cloned()
+            .map(MemoStateValue);
+        if let Some(decision) = input.memo_state(previous.as_ref()).await? {
+            memo_valid &= previous.is_some() && decision.memo_valid;
+            states.push(decision.state.0);
+        }
+    }
+    if let Some(stored) = stored {
+        memo_valid &= stored.len() == states.len();
+    }
+    Ok((states, memo_valid))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct FileMemoState {
+    modified_nanos: u128,
+    content_fingerprint: Fingerprint,
+}
+
+/// Execute `f` with memoization. If `key` hasn't changed since the last run,
+/// returns the cached result from LMDB without executing `f`.
+///
+/// The key is serialized and fingerprinted (Blake2b). The result is
+/// serialized to MessagePack for storage. Both must implement Serde.
+///
+/// When called outside an `App::update()` pipeline (no LMDB context),
+/// falls back to direct execution without caching.
+///
+/// # Examples
+/// ```ignore
+/// let html = memo::cached(&ctx, &file, |_ctx| async {
+///     Ok(render_markdown(&file.read_text()?))
+/// }).await?;
+/// ```
+pub async fn cached<K, T, F, Fut>(ctx: &Ctx, key: &K, f: F) -> Result<T>
+where
+    K: Serialize,
+    T: Serialize + for<'de> Deserialize<'de>,
+    F: FnOnce(Ctx) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let fp = key_fingerprint_result(key)?;
+    cached_by_fingerprint(ctx, fp, None, true, f).await
+}
+
+/// Fast path for callers that have already built the memo fingerprint.
+///
+/// `f` receives a `Ctx` scoped to this memo call; use it for `get_key` so
+/// change-detection dependencies attach to this memo entry.
+///
+/// `logic_fp` is the memoized function's own logic fingerprint, recorded in
+/// the frame so an enclosing memoized caller is invalidated when this
+/// function's body changes. `None` for block-level memos (`ctx.memo`) and
+/// for `logic_tracking = "none"`.
+///
+/// `propagate_children_fn_logic` is the function's `logic_tracking` mode: `true`
+/// for `"full"` (transitively-called functions' logic changes invalidate this
+/// memo entry), `false` for `"self"`/`"none"` (only this function's own body).
+#[doc(hidden)]
+pub async fn cached_by_fingerprint<T, F, Fut>(
+    ctx: &Ctx,
+    fp: Fingerprint,
+    logic_fp: Option<Fingerprint>,
+    propagate_children_fn_logic: bool,
+    f: F,
+) -> Result<T>
+where
+    T: Serialize + for<'de> Deserialize<'de>,
+    F: FnOnce(Ctx) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let probe = MemoProbe::begin(ctx, fp, logic_fp, propagate_children_fn_logic).await?;
+    match probe.lookup(Vec::new()).await? {
+        MemoLookup::Hit(value) => Ok(value),
+        MemoLookup::Miss(miss) => miss.run(f).await,
+    }
+}
+
+/// One memoized call in progress, mirroring the Python SDK's
+/// `Function.__call__`: the entry under `fp` is reserved, then the caller
+/// collects the arguments' states against the stored ones
+/// ([`cached_states`](Self::cached_states)), then [`lookup`](Self::lookup)
+/// decides between a hit and a miss, and a miss [`runs`](MemoMiss::run) the
+/// body.
+///
+/// The `#[cocoindex::function(memo)]` wrapper drives these steps itself so
+/// the arguments are only borrowed until the body runs: on a hit nothing is
+/// cloned, and on a miss the function's own arguments move into the body.
+///
+/// The call's frame is created (and seeded with the function's own logic
+/// fingerprint) before the memo probe and joined into the caller's frame on
+/// every exit path — hit, miss or error — so a memoized caller records this
+/// call's logic, context dependencies, target-provider generations and memo
+/// entry whether or not this call ran its body.
+#[doc(hidden)]
+pub struct MemoProbe<'a> {
+    ctx: &'a Ctx,
+    /// `None` outside a pipeline (standalone mode): the body always runs.
+    pipeline: Option<PipelineProbe<'a>>,
+}
+
+struct PipelineProbe<'a> {
+    comp_ctx: &'a ComponentProcessorContext<RustProfile>,
+    fp: Fingerprint,
+    fn_ctx: Arc<FnCallContext>,
+    // Field order is drop order: the frame joins the caller once this entry's
+    // write lock is released.
+    guard: FnCallMemoGuard<RustProfile>,
+    _frame: FnFrameGuard,
+}
+
+/// The outcome of [`MemoProbe::lookup`].
+#[doc(hidden)]
+pub enum MemoLookup<'a, T> {
+    /// The stored value, still valid.
+    Hit(T),
+    /// No reusable entry: run the body with [`MemoMiss::run`].
+    Miss(MemoMiss<'a>),
+}
+
+/// A memo miss: the body must run, and its result is stored under the
+/// reserved entry.
+#[doc(hidden)]
+pub struct MemoMiss<'a> {
+    /// The `Ctx` the body receives: scoped to the call's frame in a pipeline.
+    ctx: Ctx,
+    /// Boxed: a hit, the common case, does not carry a miss's state.
+    pipeline: Option<Box<PipelineMiss<'a>>>,
+}
+
+struct PipelineMiss<'a> {
+    comp_ctx: &'a ComponentProcessorContext<RustProfile>,
+    fp: Fingerprint,
+    fn_ctx: Arc<FnCallContext>,
+    /// The argument states to store with the entry.
+    memo_states: Vec<Value>,
+    guard: FnCallMemoGuard<RustProfile>,
+    _frame: FnFrameGuard,
+}
+
+impl<'a> MemoProbe<'a> {
+    /// Reserve the memo entry under `fp`. See [`cached_by_fingerprint`] for
+    /// `logic_fp` and `propagate_children_fn_logic`.
+    pub async fn begin(
+        ctx: &'a Ctx,
+        fp: Fingerprint,
+        logic_fp: Option<Fingerprint>,
+        propagate_children_fn_logic: bool,
+    ) -> Result<Self> {
+        ctx.check_cancellation()?;
+        let Some(comp_ctx) = &ctx.comp_ctx else {
+            return Ok(Self {
+                ctx,
+                pipeline: None,
+            });
+        };
+        let fn_ctx = Arc::new(FnCallContext::new(propagate_children_fn_logic));
+        if let Some(logic_fp) = logic_fp {
+            fn_ctx.add_fn_logic_dep(logic_fp);
+        }
+        let frame = ctx.frame_guard(fn_ctx.clone());
+        let guard = reserve_memoization(comp_ctx, fp).await?;
+        Ok(Self {
+            ctx,
+            pipeline: Some(PipelineProbe {
+                comp_ctx,
+                fp,
+                fn_ctx,
+                guard,
+                _frame: frame,
+            }),
+        })
+    }
+
+    /// Whether the arguments' states must be collected: `false` outside a
+    /// pipeline, where the body always runs.
+    pub fn validates_states(&self) -> bool {
+        self.pipeline.is_some()
+    }
+
+    /// The positional argument states stored with the entry, to validate the
+    /// current arguments against; `None` when there is no entry.
+    pub fn cached_states(&self) -> Option<Vec<MemoStateValue>> {
+        let cached = self.pipeline.as_ref()?.guard.cached()?;
+        Some(
+            cached
+                .memo_states
+                .iter()
+                .cloned()
+                .map(MemoStateValue)
+                .collect(),
+        )
+    }
+
+    /// Decide between a hit and a miss from the arguments' state decisions
+    /// (positional, one per argument with state), the context values' states
+    /// and the entry's data dependencies.
+    pub async fn lookup<T>(
+        self,
+        state_decisions: Vec<MemoStateDecision>,
+    ) -> Result<MemoLookup<'a, T>>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let Self { ctx, pipeline } = self;
+        let Some(PipelineProbe {
+            comp_ctx,
+            fp,
+            fn_ctx,
+            mut guard,
+            _frame,
+        }) = pipeline
+        else {
+            return Ok(MemoLookup::Miss(MemoMiss {
+                ctx: ctx.clone(),
+                pipeline: None,
+            }));
+        };
+
+        let memo_states_for_resolve = state_decisions
+            .iter()
+            .map(|decision| decision.state.0.clone())
+            .collect::<Vec<_>>();
+        let cached_context_states = guard
+            .cached()
+            .map(|cached| cached.context_memo_states.to_vec())
+            .unwrap_or_default();
+        let context_validation = ctx
+            .state
+            .context
+            .validate_memo_states(&cached_context_states)
+            .await?;
+        let states_valid = state_decisions.iter().all(|decision| decision.memo_valid)
+            && context_validation.memo_valid;
+        // Data dependencies the entry recorded (`use_data_dep`): validated only
+        // when the states still allow a reuse.
+        let data_deps = match guard.cached() {
+            Some(cached) if states_valid && !cached.data_deps.is_empty() => {
+                Some(validate_data_deps(cached.data_deps.to_vec(), "memoized function").await?)
+            }
+            _ => None,
+        };
+
+        if let Some(cached) = guard.cached()
+            && states_valid
+            && data_deps.as_ref().is_none_or(|dd| dd.can_reuse)
+        {
+            let states_changed = state_decisions
+                .iter()
+                .map(|decision| &decision.state.0.0)
+                .ne(cached.memo_states.iter().map(|value| &value.0));
+            let value: T = cached.ret.deserialize()?;
+            ctx.check_cancellation()?;
+            // The hit skips the body, so carry what it would have declared: this
+            // entry (which owns its target states) and its provider generations.
+            record_dependency_memo_entry(&fn_ctx, fp);
+            guard.join_cached_target_provider_deps(&fn_ctx);
+            // ... and the logic deps the entry recorded beneath this fn's own fp,
+            // through this frame so the caller's `logic_tracking` applies as on a
+            // miss.
+            guard.join_cached_logic_deps(&fn_ctx);
+            if states_changed
+                || context_validation.states_changed
+                || data_deps.as_ref().is_some_and(|dd| dd.states_changed)
+            {
+                guard.update_memo_states(MemoStatesPayload {
+                    positional: memo_states_for_resolve,
+                    by_context_fp: context_validation.states,
+                    data_deps: data_deps.map(|dd| dd.records).unwrap_or_default(),
+                });
+            }
+            // After the refresh, so the records re-offered to a caller stored
+            // later are the refreshed ones.
+            guard.join_cached_data_deps(&fn_ctx);
+            return Ok(MemoLookup::Hit(value));
+        }
+
+        Ok(MemoLookup::Miss(MemoMiss {
+            ctx: ctx.with_fn_ctx(fn_ctx.clone()),
+            pipeline: Some(Box::new(PipelineMiss {
+                comp_ctx,
+                fp,
+                fn_ctx,
+                memo_states: memo_states_for_resolve,
+                guard,
+                _frame,
+            })),
+        }))
+    }
+}
+
+impl MemoMiss<'_> {
+    /// Run the body and store its result under the reserved entry.
+    pub async fn run<T, F, Fut>(self, f: F) -> Result<T>
+    where
+        T: Serialize,
+        F: FnOnce(Ctx) -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let Self { ctx, pipeline } = self;
+        let Some(miss) = pipeline else {
+            // No pipeline context — execute directly (standalone mode).
+            let result = f(ctx.clone()).await?;
+            ctx.check_cancellation()?;
+            return Ok(result);
+        };
+        let PipelineMiss {
+            comp_ctx,
+            fp,
+            fn_ctx,
+            memo_states,
+            guard,
+            _frame,
+        } = *miss;
+        let result = f(ctx.clone()).await?;
+        ctx.check_cancellation()?;
+        let value = Value::from_serializable(&result)?;
+        let memo_states = MemoStatesPayload {
+            positional: memo_states,
+            by_context_fp: fn_ctx.collect_context_initial_states(comp_ctx.app_ctx().env()),
+            // The entry's records come from the frame (`build_fn_call_memo`).
+            data_deps: Vec::new(),
+        };
+        // Recorded after `resolve`, which snapshots the frame's dependency
+        // entries: an entry must not list itself.
+        if guard.resolve(&fn_ctx, || value, memo_states)? {
+            record_dependency_memo_entry(&fn_ctx, fp);
+        }
+        Ok(result)
+    }
+}
+
+fn record_dependency_memo_entry(fn_ctx: &FnCallContext, fp: Fingerprint) {
+    fn_ctx.update(|inner| {
+        inner.dependency_memo_entries.insert(fp);
+    });
+}
+
+/// Internal helper for stable memo keys in generated macros.
+///
+/// Returns an error instead of panicking so callers can fail fast with a typed
+/// error when serialization is not supported.
+#[doc(hidden)]
+pub fn key_bytes_result<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(value).map_err(Error::from)
+}
+
+pub(crate) fn key_fingerprint_result<T: Serialize + ?Sized>(value: &T) -> Result<Fingerprint> {
+    Fingerprint::from(value).map_err(|e| Error::engine(format!("fingerprint error: {e}")))
+}
+
+#[doc(hidden)]
+pub fn new_key_fingerprinter() -> Fingerprinter {
+    Fingerprinter::default()
+}
+
+#[doc(hidden)]
+pub fn write_key_fingerprint_part<T: Serialize + ?Sized>(
+    fingerprinter: &mut Fingerprinter,
+    value: &T,
+) -> Result<()> {
+    fingerprinter
+        .write(value)
+        .map_err(|e| Error::engine(format!("fingerprint error: {e}")))
+}
+
+#[doc(hidden)]
+pub fn write_key_fingerprint_part_for_arg<T: MemoInput + ?Sized>(
+    fingerprinter: &mut Fingerprinter,
+    value: &T,
+) -> Result<()> {
+    value.write_memo_key(&mut MemoKeyWriter { fingerprinter })
+}
+
+#[doc(hidden)]
+pub fn finish_key_fingerprinter(fingerprinter: Fingerprinter) -> Fingerprint {
+    fingerprinter.into_fingerprint()
+}
+
+/// The logic fingerprint of one `#[cocoindex::function]`, for generated
+/// memo wrappers.
+#[doc(hidden)]
+pub fn fn_logic_fingerprint(
+    module_path: &str,
+    fn_name: &str,
+    code_hash: u64,
+    deps_fp: Option<Fingerprint>,
+) -> Result<Fingerprint> {
+    crate::ctx::fn_logic_fingerprint(module_path, fn_name, code_hash, deps_fp)
+}
+
+/// The fingerprint of a `#[cocoindex::function(deps = ...)]` value, for
+/// generated wrappers.
+#[doc(hidden)]
+pub fn deps_fingerprint<T: MemoInput + ?Sized>(value: &T) -> Result<Fingerprint> {
+    memo_value_fingerprint(value)
+}
+
+pub(crate) fn memo_input_fingerprint<T: MemoInput + ?Sized>(
+    namespace: &str,
+    name: &str,
+    value: &T,
+) -> Result<Fingerprint> {
+    let mut fingerprinter = new_key_fingerprinter();
+    write_key_fingerprint_part(&mut fingerprinter, namespace)?;
+    write_key_fingerprint_part(&mut fingerprinter, name)?;
+    write_key_fingerprint_part_for_arg(&mut fingerprinter, value)?;
+    Ok(finish_key_fingerprinter(fingerprinter))
+}
+
+pub(crate) fn write_file_memo_key(
+    file: &dyn FileLike,
+    writer: &mut MemoKeyWriter<'_>,
+) -> Result<()> {
+    writer.write(&file.file_path().memo_key())
+}
+
+#[doc(hidden)]
+pub async fn collect_memo_arg_state<T: MemoInput + ?Sized>(
+    value: &T,
+    prev: Option<&MemoStateValue>,
+) -> Result<Option<MemoStateDecision>> {
+    if !value.has_memo_state() {
+        return Ok(None);
+    }
+    value.memo_state(prev).await
+}
+
+/// Wraps a `#[cocoindex::function(memo)]` argument so the generated code can
+/// pick its memo identity by method resolution (autoref specialization): an
+/// argument whose type implements [`MemoInput`] uses its identity and state
+/// (`MemoArgKeyViaMemoInput`, `MemoArgStateViaMemoInput`); any other
+/// `Serialize` argument, such as a target handle, uses its serialized value
+/// and has no state (`MemoArgKeyViaSerialize`, `MemoArgStateViaSerialize`).
+#[doc(hidden)]
+pub struct MemoArg<'a, T: ?Sized>(pub &'a T);
+
+#[doc(hidden)]
+pub trait MemoArgKeyViaMemoInput {
+    fn __coco_write_memo_key(&self, fingerprinter: &mut Fingerprinter) -> Result<()>;
+}
+
+impl<T: MemoInput + ?Sized> MemoArgKeyViaMemoInput for &MemoArg<'_, T> {
+    fn __coco_write_memo_key(&self, fingerprinter: &mut Fingerprinter) -> Result<()> {
+        write_key_fingerprint_part_for_arg(fingerprinter, self.0)
+    }
+}
+
+#[doc(hidden)]
+pub trait MemoArgKeyViaSerialize {
+    fn __coco_write_memo_key(&self, fingerprinter: &mut Fingerprinter) -> Result<()>;
+}
+
+impl<T: Serialize + ?Sized> MemoArgKeyViaSerialize for MemoArg<'_, T> {
+    fn __coco_write_memo_key(&self, fingerprinter: &mut Fingerprinter) -> Result<()> {
+        write_key_fingerprint_part(fingerprinter, self.0)
+    }
+}
+
+#[doc(hidden)]
+pub trait MemoArgStateViaMemoInput {
+    fn __coco_memo_state_input(&self) -> Option<&dyn MemoInput>;
+}
+
+impl<T: MemoInput> MemoArgStateViaMemoInput for &MemoArg<'_, T> {
+    fn __coco_memo_state_input(&self) -> Option<&dyn MemoInput> {
+        Some(self.0)
+    }
+}
+
+#[doc(hidden)]
+pub trait MemoArgStateViaSerialize {
+    fn __coco_memo_state_input(&self) -> Option<&dyn MemoInput>;
+}
+
+impl<T: Serialize + ?Sized> MemoArgStateViaSerialize for MemoArg<'_, T> {
+    fn __coco_memo_state_input(&self) -> Option<&dyn MemoInput> {
+        None
+    }
+}
+
+/// Whether any of `children` has memo state, for the [`crate::MemoInput`]
+/// derive.
+#[doc(hidden)]
+pub fn any_has_memo_state(children: &[&dyn MemoInput]) -> bool {
+    children.iter().any(|child| child.has_memo_state())
+}
+
+pub(crate) async fn file_memo_state(
+    file: &dyn FileLike,
+    prev: Option<&MemoStateValue>,
+) -> Result<MemoStateDecision> {
+    let metadata = file.metadata().await?;
+    let modified_nanos = system_time_nanos(metadata.modified);
+    let prev_state = prev.and_then(|value| value.deserialize::<FileMemoState>().ok());
+
+    if let Some(ref prev_state) = prev_state
+        && prev_state.modified_nanos == modified_nanos
+    {
+        return MemoStateDecision::new(&prev_state, true);
+    }
+
+    let content_fingerprint = file.content_fingerprint().await?;
+    let state = FileMemoState {
+        modified_nanos,
+        content_fingerprint,
+    };
+    let memo_valid = prev_state
+        .as_ref()
+        .is_some_and(|prev_state| prev_state.content_fingerprint == content_fingerprint);
+    MemoStateDecision::new(&state, memo_valid)
+}
+
+macro_rules! impl_file_memo_input {
+    ($ty:ty) => {
+        #[async_trait::async_trait]
+        impl $crate::memo::MemoInput for $ty {
+            fn write_memo_key(
+                &self,
+                writer: &mut $crate::memo::MemoKeyWriter<'_>,
+            ) -> $crate::Result<()> {
+                $crate::memo::write_file_memo_key(self, writer)
+            }
+
+            async fn memo_state(
+                &self,
+                previous: Option<&$crate::memo::MemoStateValue>,
+            ) -> $crate::Result<Option<$crate::memo::MemoStateDecision>> {
+                $crate::memo::file_memo_state(self, previous)
+                    .await
+                    .map(Some)
+            }
+        }
+    };
+}
+
+pub(crate) use impl_file_memo_input;
+
+fn system_time_nanos(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[allow(unused_imports)]
+    use super::{
+        MemoArgKeyViaMemoInput as _, MemoArgKeyViaSerialize as _, MemoArgStateViaMemoInput as _,
+    };
+
+    #[derive(Clone)]
+    struct Tracked {
+        id: &'static str,
+        version: u64,
+    }
+
+    #[derive(Eq, Hash, PartialEq)]
+    struct CollidingKey(&'static str);
+
+    #[async_trait]
+    impl MemoInput for Tracked {
+        fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+            writer.write(&self.id)
+        }
+
+        async fn memo_state(
+            &self,
+            previous: Option<&MemoStateValue>,
+        ) -> Result<Option<MemoStateDecision>> {
+            let previous_version = previous.and_then(|value| value.deserialize::<u64>().ok());
+            MemoStateDecision::new(&self.version, previous_version == Some(self.version)).map(Some)
+        }
+    }
+
+    #[async_trait]
+    impl MemoInput for CollidingKey {
+        fn write_memo_key(&self, writer: &mut MemoKeyWriter<'_>) -> Result<()> {
+            writer.write(&"deliberate collision")
+        }
+    }
+
+    #[derive(crate::MemoInput)]
+    struct TrackedBatch {
+        name: String,
+        items: Vec<Arc<Tracked>>,
+    }
+
+    #[derive(crate::MemoInput)]
+    enum TrackedSource {
+        Empty,
+        Batch(TrackedBatch),
+        Named { item: Tracked },
+    }
+
+    #[derive(crate::MemoInput)]
+    enum ShadowedNames {
+        Named { writer: String, previous: u64 },
+    }
+
+    fn fingerprint(value: &impl MemoInput) -> Fingerprint {
+        memo_value_fingerprint(value).unwrap()
+    }
+
+    fn previous_state(decision: &MemoStateDecision) -> MemoStateValue {
+        decision.state.clone()
+    }
+
+    /// The `#[function(memo)]` argument key picks the `MemoInput` identity
+    /// whenever the type has one, unsized slices included, so the key of a
+    /// `MemoInput` argument is what it was before the `Serialize` fallback.
+    #[test]
+    fn memo_arg_key_prefers_memo_input_identity() {
+        fn via_arg_path<T: MemoInput + ?Sized>(value: &T) -> Fingerprint {
+            let mut fp = Fingerprinter::default();
+            write_key_fingerprint_part_for_arg(&mut fp, value).unwrap();
+            fp.into_fingerprint()
+        }
+        let slice: &[u32] = &[1, 2, 3];
+        let mut fp = Fingerprinter::default();
+        (&&MemoArg(slice)).__coco_write_memo_key(&mut fp).unwrap();
+        assert_eq!(fp.into_fingerprint(), via_arg_path(slice));
+
+        let mut serde_fp = Fingerprinter::default();
+        write_key_fingerprint_part(&mut serde_fp, slice).unwrap();
+        assert_ne!(via_arg_path(slice), serde_fp.into_fingerprint());
+
+        assert!((&&MemoArg(&vec![1u32])).__coco_memo_state_input().is_some());
+    }
+
+    #[test]
+    fn recursive_sequence_fingerprints_are_framed_and_ordered() {
+        assert_ne!(
+            fingerprint(&vec!["ab".to_string(), "c".to_string()]),
+            fingerprint(&vec!["a".to_string(), "bc".to_string()]),
+        );
+        assert_ne!(
+            fingerprint(&vec!["a".to_string(), "b".to_string()]),
+            fingerprint(&vec!["b".to_string(), "a".to_string()]),
+        );
+    }
+
+    #[test]
+    fn bytes_use_bulk_encoding_while_vec_u8_remains_a_sequence() {
+        let value = bytes::Bytes::from_static(b"bulk bytes");
+        let mut expected = Fingerprinter::default();
+        serde::Serializer::serialize_bytes(&mut expected, value.as_ref()).unwrap();
+
+        assert_eq!(fingerprint(&value), expected.into_fingerprint());
+        assert_ne!(fingerprint(&value), fingerprint(&value.to_vec()));
+    }
+
+    #[test]
+    fn all_advertised_integer_leaves_are_fingerprintable() {
+        assert_ne!(fingerprint(&i128::MIN), fingerprint(&i128::MAX));
+        assert_ne!(fingerprint(&u128::MIN), fingerprint(&u128::MAX));
+        assert_ne!(fingerprint(&i128::MAX), fingerprint(&(i128::MAX as u128)));
+    }
+
+    #[test]
+    fn tuple_identity_is_tagged_ordered_and_distinct_from_vec() {
+        let tuple = ("a".to_string(), "b".to_string());
+        assert_ne!(
+            fingerprint(&tuple),
+            fingerprint(&(tuple.1.clone(), tuple.0.clone()))
+        );
+        assert_ne!(fingerprint(&tuple), fingerprint(&vec![tuple.0, tuple.1]));
+    }
+
+    #[test]
+    fn option_pointer_and_set_framing_are_structural() {
+        assert_ne!(
+            fingerprint(&None::<String>),
+            fingerprint(&Vec::<String>::new())
+        );
+        assert_ne!(
+            fingerprint(&None::<String>),
+            fingerprint(&Some(String::new()))
+        );
+
+        let value = "value".to_string();
+        assert_eq!(fingerprint(&value), fingerprint(&Box::new(value.clone())));
+        assert_eq!(fingerprint(&value), fingerprint(&Arc::new(value)));
+
+        let first = HashSet::from(["a".to_string(), "b".to_string()]);
+        let mut second = HashSet::new();
+        second.insert("b".to_string());
+        second.insert("a".to_string());
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+        let ordered = BTreeSet::from(["a".to_string(), "b".to_string()]);
+        assert_eq!(fingerprint(&first), fingerprint(&ordered));
+    }
+
+    #[test]
+    fn derive_tags_types_and_handles_reserved_named_enum_fields() {
+        #[derive(crate::MemoInput)]
+        struct First {
+            value: String,
+        }
+
+        #[derive(crate::MemoInput)]
+        struct Second {
+            value: String,
+        }
+
+        assert_ne!(
+            fingerprint(&First {
+                value: "same".to_string(),
+            }),
+            fingerprint(&Second {
+                value: "same".to_string(),
+            }),
+        );
+        let _ = fingerprint(&ShadowedNames::Named {
+            writer: "value".to_string(),
+            previous: 1,
+        });
+    }
+
+    #[test]
+    fn hash_map_fingerprint_is_insertion_order_independent() {
+        let first = HashMap::from([("a".to_string(), 1_u64), ("b".to_string(), 2)]);
+        let mut second = HashMap::new();
+        second.insert("b".to_string(), 2_u64);
+        second.insert("a".to_string(), 1_u64);
+        assert_eq!(fingerprint(&first), fingerprint(&second));
+    }
+
+    #[tokio::test]
+    async fn unordered_identity_collision_forces_recomputation_without_error() {
+        let values = HashMap::from([
+            (CollidingKey("a"), "first".to_string()),
+            (CollidingKey("b"), "second".to_string()),
+        ]);
+        let first = values.memo_state(None).await.unwrap().unwrap();
+        assert!(!first.memo_valid);
+        let second = values
+            .memo_state(Some(&previous_state(&first)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!second.memo_valid);
+    }
+
+    #[tokio::test]
+    async fn nested_sequence_preserves_child_state_validation() {
+        let initial = vec![
+            Tracked {
+                id: "a",
+                version: 1,
+            },
+            Tracked {
+                id: "b",
+                version: 1,
+            },
+        ];
+        let first = initial.memo_state(None).await.unwrap().unwrap();
+        assert!(!first.memo_valid);
+
+        let unchanged = initial
+            .memo_state(Some(&previous_state(&first)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.memo_valid);
+
+        let changed = vec![
+            Tracked {
+                id: "a",
+                version: 1,
+            },
+            Tracked {
+                id: "b",
+                version: 2,
+            },
+        ]
+        .memo_state(Some(&previous_state(&unchanged)))
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!changed.memo_valid);
+    }
+
+    #[tokio::test]
+    async fn unordered_map_reordering_preserves_child_state_alignment() {
+        let mut initial = HashMap::new();
+        initial.insert(
+            "a".to_string(),
+            Tracked {
+                id: "a",
+                version: 1,
+            },
+        );
+        initial.insert(
+            "b".to_string(),
+            Tracked {
+                id: "b",
+                version: 1,
+            },
+        );
+        let first = initial.memo_state(None).await.unwrap().unwrap();
+
+        let mut reordered = HashMap::new();
+        reordered.insert(
+            "b".to_string(),
+            Tracked {
+                id: "b",
+                version: 1,
+            },
+        );
+        reordered.insert(
+            "a".to_string(),
+            Tracked {
+                id: "a",
+                version: 1,
+            },
+        );
+        let unchanged = reordered
+            .memo_state(Some(&previous_state(&first)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.memo_valid);
+
+        reordered.get_mut("b").unwrap().version = 2;
+        let changed = reordered
+            .memo_state(Some(&previous_state(&unchanged)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!changed.memo_valid);
+    }
+
+    #[tokio::test]
+    async fn derive_recurses_through_struct_enum_vec_and_arc() {
+        let source = TrackedSource::Batch(TrackedBatch {
+            name: "batch".to_string(),
+            items: vec![Arc::new(Tracked {
+                id: "item",
+                version: 3,
+            })],
+        });
+        let first = source.memo_state(None).await.unwrap().unwrap();
+        let unchanged = source
+            .memo_state(Some(&previous_state(&first)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.memo_valid);
+
+        let changed = TrackedSource::Batch(TrackedBatch {
+            name: "batch".to_string(),
+            items: vec![Arc::new(Tracked {
+                id: "item",
+                version: 4,
+            })],
+        })
+        .memo_state(Some(&previous_state(&unchanged)))
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!changed.memo_valid);
+
+        assert_ne!(fingerprint(&TrackedSource::Empty), fingerprint(&source));
+        assert_ne!(
+            fingerprint(&TrackedSource::Named {
+                item: Tracked {
+                    id: "item",
+                    version: 3,
+                },
+            }),
+            fingerprint(&source),
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_nested_state_causes_a_miss_not_an_error() {
+        let values = vec![Tracked {
+            id: "item",
+            version: 1,
+        }];
+        let malformed = MemoStateValue::from_serializable(&"not a nested state").unwrap();
+        let decision = values.memo_state(Some(&malformed)).await.unwrap().unwrap();
+        assert!(!decision.memo_valid);
+    }
+
+    #[tokio::test]
+    async fn malformed_state_for_stateless_container_still_causes_one_miss() {
+        let values = vec!["item".to_string()];
+        let malformed = MemoStateValue::from_serializable(&"not a nested state").unwrap();
+        let replacement = values.memo_state(Some(&malformed)).await.unwrap().unwrap();
+        assert!(!replacement.memo_valid);
+
+        let unchanged = values
+            .memo_state(Some(&previous_state(&replacement)))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.memo_valid);
+    }
+
+    #[tokio::test]
+    async fn stateless_nested_values_do_not_store_state() {
+        let values = vec![Some("a".to_string()), None];
+        assert!(values.memo_state(None).await.unwrap().is_none());
+    }
+
+    #[cfg(all(feature = "chrono", feature = "rust_decimal"))]
+    #[test]
+    fn ecosystem_schema_leaf_types_compose_in_derived_inputs() {
+        #[derive(crate::MemoInput)]
+        struct EcosystemLeaves {
+            timestamp: chrono::DateTime<chrono::Utc>,
+            date: chrono::NaiveDate,
+            id: uuid::Uuid,
+            json: serde_json::Value,
+            decimal: rust_decimal::Decimal,
+        }
+
+        let value = EcosystemLeaves {
+            timestamp: "2024-01-02T03:04:05Z".parse().unwrap(),
+            date: chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap(),
+            id: uuid::Uuid::nil(),
+            json: serde_json::json!({"nested": [1, 2, 3]}),
+            decimal: rust_decimal::Decimal::new(1234, 2),
+        };
+        let _ = fingerprint(&value);
+    }
+}

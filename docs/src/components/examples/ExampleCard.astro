@@ -1,0 +1,40 @@
+---
+// One card in the examples catalog. The header is the example's pipeline
+// (Pipeline.astro, from its tags); the body is title, one-paragraph summary,
+// and a mono meta line (time · level) pinned to the bottom so rows align.
+// data-* attributes carry the facet values the listing's filter reads.
+import { titleText } from '../../consts';
+import { facetOf, timeOf, levelOf, type ExampleCard } from '../../data/examples';
+import Pipeline from './Pipeline.astro';
+import Scene from './Scene.astro';
+import { hasScene } from './scenes/meta';
+
+interface Props {
+  ex: ExampleCard;
+  href: string;
+}
+const { ex, href } = Astro.props;
+const title = titleText(ex.title);
+---
+<a
+  class="ex-card"
+  href={href}
+  data-cat={ex.category}
+  data-src={facetOf(ex, 'src').join('|')}
+  data-tgt={facetOf(ex, 'tgt').join('|')}
+  data-llm={facetOf(ex, 'llm').join('|')}
+  data-lvl={facetOf(ex, 'lvl').join('|')}
+>
+  {hasScene(ex.slug) ? (
+    <div class="ex-card-art"><Scene slug={ex.slug} size="card" /><div class="ex-card-pipe is-under"><Pipeline ex={ex} size="sm" /></div></div>
+  ) : (
+    <div class="ex-card-pipe">
+      <Pipeline ex={ex} size="sm" />
+    </div>
+  )}
+  <div class="ex-card-body">
+    <h3 id={`ex-t-${ex.slug}`}>{title}</h3>
+    <p id={`ex-d-${ex.slug}`}>{ex.description}</p>
+    <p class="ex-card-meta" id={`ex-m-${ex.slug}`}><span class="t">{timeOf(ex)}</span>{levelOf(ex) && <><span class="sep" aria-hidden="true">·</span><span>{levelOf(ex)}</span></>}</p>
+  </div>
+</a>

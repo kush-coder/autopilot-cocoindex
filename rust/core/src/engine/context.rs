@@ -1,0 +1,2241 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use cocoindex_utils::fingerprint::Fingerprint;
+
+use crate::engine::admission::{Admission, AdmissionPool, Lender, UpdateShare};
+use crate::engine::component::{Component, ComponentBgChildReadiness, StatsGroup};
+use crate::engine::deadline::DeadlineContext;
+use crate::engine::id_sequencer::IdSequencerManager;
+use crate::engine::profile::EngineProfile;
+use crate::engine::stats::ProcessingStats;
+use crate::engine::target_state::{TargetStateProvider, TargetStateProviderRegistry};
+use crate::prelude::*;
+
+use crate::state::component_selector::{ComponentSelection, ComponentSelector};
+use crate::state::stable_path::StableKey;
+
+pub(crate) static TARGET_ID_KEY: LazyLock<StableKey> =
+    LazyLock::new(|| StableKey::Symbol("cocoindex/_internal/target_id".into()));
+use crate::state::stable_path_set::{ChildStablePathSet, StablePathSet};
+use crate::state::target_state_path::{
+    TargetProviderDeps, TargetStatePath, TargetStateProviderGeneration,
+};
+use crate::{
+    engine::environment::{AppRegistration, Environment},
+    state::stable_path::StablePath,
+    state_store::AppStore,
+};
+
+use cocoindex_utils::deser::from_msgpack_slice;
+
+use crate::engine::execution::{
+    deserialize_context_memo_states, deserialize_memo_values, serialize_context_memo_states,
+    serialize_memo_values,
+};
+use crate::engine::profile::Persist;
+
+struct AppContextInner<Prof: EngineProfile> {
+    env: Environment<Prof>,
+    app_store: AppStore,
+    app_reg: AppRegistration<Prof>,
+    id_sequencer_manager: IdSequencerManager,
+    /// The pool of in-flight tokens component runs are admitted to; see
+    /// [`crate::engine::admission`].
+    admission_pool: AdmissionPool,
+    /// Source of operation generations; see
+    /// [`ComponentProcessorContext::operation_generation`].
+    operation_generation: std::sync::atomic::AtomicU64,
+    /// Cancellation token for in-flight app operations. Wrapped in a `Mutex` so
+    /// it can be replaced with a fresh child of the global token after a
+    /// previous cancellation (e.g. after `App::drop_app` finishes), allowing
+    /// the same `App` instance to be reused for subsequent operations.
+    cancellation_token: std::sync::Mutex<tokio_util::sync::CancellationToken>,
+
+    /// Flat registry of all live components mounted under this app.
+    /// `mount_live_async` registers (compacts then pushes) before returning;
+    /// `App::drop_app` walks this at shutdown to drain each.
+    /// Stores `Weak` so a freed `LiveComponentState` is naturally collected
+    /// on the next compaction.
+    /// Compaction-on-push: callers call `register_live_component` which removes
+    /// dead entries before appending — bounding registry size by live count
+    /// plus pending GC.
+    live_components: parking_lot::Mutex<
+        Vec<std::sync::Weak<crate::engine::live_component::LiveComponentState<Prof>>>,
+    >,
+
+    /// Root target-state providers (with their attachment providers) that
+    /// this app's runs registered at run time, by path; the latest
+    /// registration of a path wins. Such a provider lives in its run's build
+    /// state only, not in the environment's registry, so `App::drop_app`
+    /// adds these to revert the target states they own.
+    run_root_providers: parking_lot::Mutex<HashMap<TargetStatePath, TargetStateProvider<Prof>>>,
+}
+
+#[derive(Clone)]
+pub struct AppContext<Prof: EngineProfile> {
+    inner: Arc<AppContextInner<Prof>>,
+}
+
+impl<Prof: EngineProfile> AppContext<Prof> {
+    pub fn new(
+        env: Environment<Prof>,
+        app_store: AppStore,
+        app_reg: AppRegistration<Prof>,
+        max_inflight_components: Option<usize>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(AppContextInner {
+                env,
+                id_sequencer_manager: IdSequencerManager::new(app_store.clone()),
+                app_store,
+                app_reg,
+                admission_pool: AdmissionPool::new(max_inflight_components),
+                operation_generation: std::sync::atomic::AtomicU64::new(0),
+                cancellation_token: std::sync::Mutex::new(
+                    crate::engine::runtime::global_cancellation_token().child_token(),
+                ),
+                live_components: parking_lot::Mutex::new(Vec::new()),
+                run_root_providers: parking_lot::Mutex::new(HashMap::new()),
+            }),
+        }
+    }
+
+    /// Remember root providers a run registered; see `run_root_providers`.
+    pub(crate) fn remember_run_root_providers(
+        &self,
+        providers: impl IntoIterator<Item = (TargetStatePath, TargetStateProvider<Prof>)>,
+    ) {
+        self.inner.run_root_providers.lock().extend(providers);
+    }
+
+    /// The root providers this app's runs registered; see
+    /// `run_root_providers`.
+    pub(crate) fn run_root_providers(&self) -> Vec<(TargetStatePath, TargetStateProvider<Prof>)> {
+        self.inner
+            .run_root_providers
+            .lock()
+            .iter()
+            .map(|(path, provider)| (path.clone(), provider.clone()))
+            .collect()
+    }
+
+    /// Register a live component for shutdown drain coverage.
+    ///
+    /// Compacts dead `Weak`s out of the registry before appending the new one,
+    /// so size is bounded by live + pending-GC count. The `Weak` is upgraded
+    /// during `App::drop_app`'s walk to drive `cancel_and_await_quiescence`.
+    pub fn register_live_component(
+        &self,
+        weak: std::sync::Weak<crate::engine::live_component::LiveComponentState<Prof>>,
+    ) {
+        let mut registry = self.inner.live_components.lock();
+        registry.retain(|w| w.upgrade().is_some());
+        registry.push(weak);
+    }
+
+    /// Atomically: cancel the app token AND snapshot the live-components
+    /// registry into upgraded `Arc`s. Returns the snapshot.
+    ///
+    /// Acquiring the lock first closes a race: a concurrent
+    /// `mount_live_async` mid-execution that captured an uncancelled
+    /// parent_ctx token will either (a) finish registering before this lock
+    /// acquisition (caught by the snapshot) or (b) queue behind the lock and
+    /// see the cancelled token immediately on first poll once we release.
+    pub fn cancel_and_snapshot_live_components(
+        &self,
+    ) -> Vec<Arc<crate::engine::live_component::LiveComponentState<Prof>>> {
+        let registry = self.inner.live_components.lock();
+        // Cancel inside the lock so a post-release registration sees the
+        // cancelled token.
+        self.inner.cancellation_token.lock().unwrap().cancel();
+        registry
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
+    }
+
+    pub fn env(&self) -> &Environment<Prof> {
+        &self.inner.env
+    }
+
+    /// The app's state store, persisting every write: for deriving a root
+    /// run's handle, and for inspection. A component run reads and writes
+    /// through [`ComponentProcessorContext::app_store`] instead, which
+    /// persists nothing in a preview.
+    pub(crate) fn persisting_app_store(&self) -> &AppStore {
+        &self.inner.app_store
+    }
+
+    pub fn app_reg(&self) -> &AppRegistration<Prof> {
+        &self.inner.app_reg
+    }
+
+    pub fn admission_pool(&self) -> &AdmissionPool {
+        &self.inner.admission_pool
+    }
+
+    /// Mint the generation of a new operation; see
+    /// [`ComponentProcessorContext::operation_generation`].
+    fn next_operation_generation(&self) -> u64 {
+        self.inner
+            .operation_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// Returns a clone of the current app-level cancellation token.
+    ///
+    /// The clone stays valid even if the slot is later refreshed via
+    /// `reset_cancellation_token_if_cancelled`.
+    pub fn cancellation_token(&self) -> tokio_util::sync::CancellationToken {
+        self.inner.cancellation_token.lock().unwrap().clone()
+    }
+
+    /// Replace the app-level cancellation token with a fresh child of the global
+    /// token if the current one has been cancelled. Call this before starting a
+    /// new app operation so a prior cancellation (e.g. via `drop_app`) does not
+    /// poison subsequent runs.
+    pub fn reset_cancellation_token_if_cancelled(&self) {
+        let mut slot = self.inner.cancellation_token.lock().unwrap();
+        if slot.is_cancelled() {
+            *slot = crate::engine::runtime::global_cancellation_token().child_token();
+        }
+    }
+
+    /// Get the next ID for the given key.
+    ///
+    /// IDs are allocated in batches for efficiency. The key can be `None` for a default sequencer.
+    /// A preview reserves ids like an update: ids are opaque, so the gap its
+    /// unused ids leave costs nothing, and the sequencer is the one state a
+    /// preview persists — the manager owns the app's persisting store, not a
+    /// run's handle.
+    pub async fn next_id(&self, key: Option<&StableKey>, deadline: DeadlineContext) -> Result<u64> {
+        deadline.check()?;
+        let default_key = StableKey::Null;
+        let key = key.unwrap_or(&default_key);
+        self.inner.id_sequencer_manager.next_id(key).await
+    }
+}
+
+pub(crate) struct DeclaredTargetState<Prof: EngineProfile> {
+    pub provider: TargetStateProvider<Prof>,
+    /// The item key, `storekey`-encoded: the form pre-commit records it in,
+    /// at a fraction of the size of the decoded key's tree of `Arc`s.
+    pub item_key_bytes: Box<[u8]>,
+    pub value: Prof::TargetStateValue,
+    pub child_provider: Option<TargetStateProvider<Prof>>,
+}
+
+pub(crate) struct ComponentTargetStatesContext<Prof: EngineProfile> {
+    pub declared_target_states: BTreeMap<TargetStatePath, DeclaredTargetState<Prof>>,
+    pub provider_registry: TargetStateProviderRegistry<Prof>,
+}
+
+/// One data dependency a body recorded with `use_data_dep`: what it read
+/// (`key`) and what it observed (`state`), as the serialized snapshot taken at
+/// the call, with the fingerprints of those bytes. `key_fp` is the record's
+/// identity within its kind and `state_fp` its equality; neither goes through
+/// the memo-key pipeline, so two unequal observations never collapse into one.
+#[derive(Clone, Debug)]
+pub struct DataDepRecord {
+    pub kind_fp: Fingerprint,
+    pub key_fp: Fingerprint,
+    pub state_fp: Fingerprint,
+    pub key: bytes::Bytes,
+    pub state: bytes::Bytes,
+}
+
+/// The data dependencies a frame or a component recorded in one run.
+///
+/// One record per `(kind_fp, key_fp)`. Recording a key again with an equal
+/// state is a no-op; with a different state it marks a *conflict*: output that
+/// used two states of one key has no single state to validate against, so the
+/// run stores no entry (see `FnCallMemoGuard::resolve` and
+/// `Component::execute_once`). The rule is symmetric, so merge order does not
+/// matter.
+#[derive(Clone, Debug, Default)]
+pub struct DataDeps {
+    records: HashMap<(Fingerprint, Fingerprint), DataDepRecord>,
+    /// The first `(kind_fp, key_fp)` observed in two states, if any.
+    conflict: Option<(Fingerprint, Fingerprint)>,
+}
+
+impl DataDeps {
+    pub fn insert(&mut self, record: DataDepRecord) {
+        match self.records.entry((record.kind_fp, record.key_fp)) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(record);
+            }
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                if slot.get().state_fp != record.state_fp {
+                    self.conflict.get_or_insert((record.kind_fp, record.key_fp));
+                }
+            }
+        }
+    }
+
+    pub fn merge(&mut self, other: DataDeps) {
+        if self.conflict.is_none() {
+            self.conflict = other.conflict;
+        }
+        for record in other.records.into_values() {
+            self.insert(record);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// The first key observed in two states during the run, as
+    /// `(kind_fp, key_fp)`, if any.
+    pub fn conflict(&self) -> Option<(Fingerprint, Fingerprint)> {
+        self.conflict
+    }
+
+    /// The records sorted by `(kind_fp, key_fp)`, for deterministic storage.
+    pub fn sorted_records(&self) -> Vec<DataDepRecord> {
+        let mut records: Vec<DataDepRecord> = self.records.values().cloned().collect();
+        records.sort_by_key(|r| (r.kind_fp, r.key_fp));
+        records
+    }
+
+    /// [`sorted_records`](Self::sorted_records), consuming the set.
+    pub fn into_sorted_records(self) -> Vec<DataDepRecord> {
+        let mut records: Vec<DataDepRecord> = self.records.into_values().collect();
+        records.sort_by_key(|r| (r.kind_fp, r.key_fp));
+        records
+    }
+}
+
+/// Encode records for storage. `key` and `state` are already the serialized
+/// snapshot, so this only re-wraps the bytes.
+pub(crate) fn encode_data_deps(records: &[DataDepRecord]) -> Vec<db_schema::DataDepEntry<'_>> {
+    records
+        .iter()
+        .map(|r| db_schema::DataDepEntry {
+            kind_fp: r.kind_fp,
+            key_fp: r.key_fp,
+            state_fp: r.state_fp,
+            key: db_schema::MemoizedValue::Inlined(Cow::Borrowed(r.key.as_ref())),
+            state: db_schema::MemoizedValue::Inlined(Cow::Borrowed(r.state.as_ref())),
+        })
+        .collect()
+}
+
+pub(crate) fn decode_data_deps(entries: Vec<db_schema::DataDepEntry<'_>>) -> Vec<DataDepRecord> {
+    entries
+        .into_iter()
+        .map(|e| {
+            let db_schema::MemoizedValue::Inlined(key) = e.key;
+            let db_schema::MemoizedValue::Inlined(state) = e.state;
+            DataDepRecord {
+                kind_fp: e.kind_fp,
+                key_fp: e.key_fp,
+                state_fp: e.state_fp,
+                key: bytes::Bytes::copy_from_slice(key.as_ref()),
+                state: bytes::Bytes::copy_from_slice(state.as_ref()),
+            }
+        })
+        .collect()
+}
+
+pub struct FnCallMemo<Prof: EngineProfile> {
+    pub ret: Prof::FunctionData,
+    pub(crate) target_state_paths: Vec<TargetStatePath>,
+    pub(crate) target_provider_deps: TargetProviderDeps,
+    pub(crate) dependency_memo_entries: HashSet<Fingerprint>,
+    pub(crate) logic_deps: HashSet<Fingerprint>,
+    pub memo_states: Vec<Prof::FunctionData>,
+    /// Context-borne memo states, keyed by tracked-context value fingerprint.
+    /// See `db_schema::FunctionMemoizationEntry::context_memo_states`.
+    pub context_memo_states: Vec<(Fingerprint, Vec<Prof::FunctionData>)>,
+    /// Data dependencies the call recorded, sorted by `(kind_fp, key_fp)`.
+    /// See `db_schema::FunctionMemoizationEntry::data_deps`.
+    pub data_deps: Vec<DataDepRecord>,
+    /// The DB row already holds this entry. Cleared when the entry is
+    /// built from a run or its memo states are refreshed after a hit, so the
+    /// flush writes it.
+    pub(crate) persisted: bool,
+    /// The entry's cached output was carried over this run instead of the
+    /// body running: its target states were not re-declared, so finalization
+    /// must keep them (and the entries it depends on) alive. Independent of
+    /// `persisted`: a memo-state refresh after a hit clears `persisted` but
+    /// leaves this set.
+    pub(crate) reused: bool,
+}
+
+/// Combined payload of positional and context-borne memo states.
+///
+/// Used to thread both halves through the `ComponentProcessor::handle_memo_states`
+/// callback and through function-level memoization APIs. The core crate treats
+/// the context fingerprints and values as opaque data — both come from Python in
+/// the Python profile and are round-tripped through the Python state handler.
+pub struct MemoStatesPayload<Prof: EngineProfile> {
+    pub positional: Vec<Prof::FunctionData>,
+    pub by_context_fp: Vec<(Fingerprint, Vec<Prof::FunctionData>)>,
+    /// Data dependencies, validated by the host beside the states: stored
+    /// records on a hit, refreshed records back from the handler.
+    pub data_deps: Vec<DataDepRecord>,
+}
+
+impl<Prof: EngineProfile> Default for MemoStatesPayload<Prof> {
+    fn default() -> Self {
+        Self {
+            positional: Vec::new(),
+            by_context_fp: Vec::new(),
+            data_deps: Vec::new(),
+        }
+    }
+}
+
+impl<Prof: EngineProfile> MemoStatesPayload<Prof> {
+    pub fn is_empty(&self) -> bool {
+        self.positional.is_empty() && self.by_context_fp.is_empty() && self.data_deps.is_empty()
+    }
+}
+
+#[derive(Default)]
+pub enum FnCallMemoEntry<Prof: EngineProfile> {
+    /// Prefetched from the database but not yet accessed during this build.
+    /// Lazily decoded on first access (transitions to `Ready` or stays
+    /// `Stored` for later GC). Treated as untouched at flush time.
+    Stored(Vec<u8>),
+    /// Memoization result is pending, i.e. the function call is not finished yet.
+    #[default]
+    Pending,
+    /// Memoization result is ready. None means memoization is disabled, e.g. it mounts child components.
+    Ready(Option<FnCallMemo<Prof>>),
+}
+
+/// In-memory cache of all function-memoization entries for a single
+/// component build. Populated by [`Self::prefetch`] (one prefix scan over
+/// the storage layer) at the start of build mode, then serves every
+/// subsequent fn-memo lookup in memory. New entries from cache-miss
+/// executions accumulate here; [`Self::into_flush_plan`] produces the diff
+/// that is applied to storage atomically at commit time.
+pub(crate) struct FnMemoCache<Prof: EngineProfile> {
+    /// All known fn-memo entries for this component. Prefetched entries
+    /// start as `Stored(bytes)` and lazily decode to `Ready` on first
+    /// access; cache-miss inserts go straight to `Pending` then `Ready`.
+    entries: HashMap<Fingerprint, Arc<tokio::sync::RwLock<FnCallMemoEntry<Prof>>>>,
+    /// True after a successful `prefetch`. Stays false under
+    /// `full_reprocess` (prefetch skipped) or before `prefetch` runs.
+    /// Determines the flush strategy: per-entry writes/deletes when true,
+    /// prefix-delete + per-entry writes when false.
+    is_fully_loaded: bool,
+}
+
+impl<Prof: EngineProfile> FnMemoCache<Prof> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            is_fully_loaded: false,
+        }
+    }
+
+    /// Insert prefetched rows from the database into the cache and mark it
+    /// fully loaded. The async I/O lives at the context layer
+    /// ([`ComponentProcessorContext::prefetch_states`]); this is the sync
+    /// half that runs under the building-state mutex.
+    pub(crate) fn populate(&mut self, rows: Vec<(Fingerprint, Vec<u8>)>) {
+        for (fp, bytes) in rows {
+            self.entries.entry(fp).or_insert_with(|| {
+                Arc::new(tokio::sync::RwLock::new(FnCallMemoEntry::Stored(bytes)))
+            });
+        }
+        self.is_fully_loaded = true;
+    }
+
+    /// Get the entry for `fp`, inserting a `Pending` slot if absent. The
+    /// returned `Arc<RwLock<_>>` is what `reserve_memoization` locks.
+    pub(crate) fn entry_or_pending(
+        &mut self,
+        fp: Fingerprint,
+    ) -> Arc<tokio::sync::RwLock<FnCallMemoEntry<Prof>>> {
+        self.entries
+            .entry(fp)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(FnCallMemoEntry::Pending)))
+            .clone()
+    }
+
+    /// Read-only lookup. Returns `None` if no entry exists for `fp`. Used
+    /// by the finalize-time dep walk.
+    pub(crate) fn get(
+        &self,
+        fp: Fingerprint,
+    ) -> Option<Arc<tokio::sync::RwLock<FnCallMemoEntry<Prof>>>> {
+        self.entries.get(&fp).cloned()
+    }
+
+    pub(crate) fn is_fully_loaded(&self) -> bool {
+        self.is_fully_loaded
+    }
+
+    /// Walk all entries. Used by finalize to enumerate touched/untouched
+    /// state without consuming the cache.
+    pub(crate) fn iter(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &Fingerprint,
+            &Arc<tokio::sync::RwLock<FnCallMemoEntry<Prof>>>,
+        ),
+    > {
+        self.entries.iter()
+    }
+
+    /// Consume the cache, classify entries, and serialize the writes
+    /// into a [`FnMemoFlushPlan`] that can be re-applied to storage
+    /// across retries.
+    ///
+    /// Inclusion rule:
+    ///
+    /// - `Ready(Some, persisted=false)` → serialize bytes into `writes`
+    ///   (new, re-executed, or refreshed entries that must be written).
+    /// - `Ready(Some, persisted=true)` → skip (DB row already correct).
+    /// - `Stored(_)` and `Ready(None)` → record in `deletes`, only when
+    ///   `is_fully_loaded=true` (otherwise these entries can't exist on
+    ///   disk because prefetch didn't run).
+    /// - `Pending` → no-op (the function errored before resolving; no
+    ///   DB row exists or needs to exist).
+    ///
+    /// `clear_all_first` is set when `!is_fully_loaded` so the apply
+    /// step prefix-deletes the whole range before writing `writes`.
+    pub(crate) fn into_flush_plan(self) -> Result<FnMemoFlushPlan> {
+        let mut plan = FnMemoFlushPlan {
+            clear_all_first: !self.is_fully_loaded,
+            writes: Vec::new(),
+            deletes: Vec::new(),
+        };
+        for (fp, lock) in self.entries.into_iter() {
+            // No other holders at flush time — extract by reference under
+            // a try_write guard rather than unwrapping the Arc, since
+            // upstream cancellation paths may have leaked clones.
+            let mut guard = lock.try_write().map_err(|_| {
+                internal_error!("fn memo entry for {fp:?} still locked at flush time")
+            })?;
+            let state = std::mem::replace(&mut *guard, FnCallMemoEntry::Pending);
+            match state {
+                FnCallMemoEntry::Ready(Some(memo)) => {
+                    if memo.persisted {
+                        // Cache hit without refresh: DB row already correct.
+                        continue;
+                    }
+                    let ret_bytes = memo.ret.to_bytes()?;
+                    let memo_states_serialized = serialize_memo_values::<Prof>(&memo.memo_states)?;
+                    let context_memo_states_serialized =
+                        serialize_context_memo_states::<Prof>(&memo.context_memo_states)?;
+                    let entry = db_schema::FunctionMemoizationEntry {
+                        return_value: db_schema::MemoizedValue::Inlined(Cow::Borrowed(
+                            ret_bytes.as_ref(),
+                        )),
+                        child_components: vec![],
+                        target_state_paths: memo.target_state_paths,
+                        // Already sorted — `TargetProviderDeps` is a `BTreeMap`.
+                        target_provider_deps: memo.target_provider_deps.into_iter().collect(),
+                        dependency_memo_entries: memo.dependency_memo_entries.into_iter().collect(),
+                        logic_deps: memo.logic_deps.into_iter().collect(),
+                        memo_states: memo_states_serialized,
+                        context_memo_states: context_memo_states_serialized,
+                        data_deps: encode_data_deps(&memo.data_deps),
+                    };
+                    let encoded = rmp_serde::to_vec_named(&entry)?;
+                    plan.writes.push((fp, encoded));
+                }
+                FnCallMemoEntry::Stored(_) | FnCallMemoEntry::Ready(None) => {
+                    if self.is_fully_loaded {
+                        // Stored: untouched prefetched entry, stale.
+                        // Ready(None): memoization disabled at runtime.
+                        plan.deletes.push(fp);
+                    }
+                }
+                FnCallMemoEntry::Pending => {
+                    // The slot was inserted via `entry_or_pending` for a fp not
+                    // present in the prefetched cache (prefetched fps decode
+                    // to `Ready` in `reserve_memoization`, never end up
+                    // Pending). The function call then errored before
+                    // resolving — e.g. the caller wrapped it in try/except
+                    // and continued. Such fps have no DB row, so nothing to
+                    // write or delete.
+                }
+            }
+        }
+        Ok(plan)
+    }
+}
+
+/// A serialized, re-applyable diff produced by
+/// [`FnMemoCache::into_flush_plan`]. Owns the encoded bytes for every
+/// write so `apply_to_db` can be called repeatedly across retries
+/// without re-touching the cache.
+pub(crate) struct FnMemoFlushPlan {
+    pub(crate) clear_all_first: bool,
+    pub(crate) writes: Vec<(Fingerprint, Vec<u8>)>,
+    pub(crate) deletes: Vec<Fingerprint>,
+}
+
+impl<Prof: EngineProfile> Default for FnMemoCache<Prof> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Decode a `Stored(bytes)` entry into `Ready(Some(memo))` if the entry's
+/// stored logic deps still resolve. If the deps no longer resolve (e.g.
+/// logic registry no longer contains a fingerprint), or the entry is a
+/// legacy form with `child_components`, the result is `Ready(None)` so
+/// the entry is treated as a deletion at flush time.
+///
+/// Target-provider generation deps are deliberately NOT checked here — the
+/// finalize dep walk also decodes entries to collect their contained target
+/// state paths, and invalidating on a generation mismatch there would drop
+/// live paths from the contained set. That check lives in
+/// `reserve_memoization`, the probe path proper.
+///
+/// This helper is shared between `reserve_memoization` (probe path) and
+/// the finalize dep walk; both call it under the per-entry write lock.
+///
+/// `*entry` must be `Stored(_)` on entry. After this call it is `Ready`.
+pub(crate) fn decode_stored_entry<Prof: EngineProfile>(
+    entry: &mut FnCallMemoEntry<Prof>,
+    env: &Environment<Prof>,
+) -> Result<()> {
+    let FnCallMemoEntry::Stored(bytes) = std::mem::replace(entry, FnCallMemoEntry::Pending) else {
+        internal_bail!("decode_stored_entry called on non-Stored entry");
+    };
+    let decoded: db_schema::FunctionMemoizationEntry<'_> = from_msgpack_slice(&bytes)?;
+    if !crate::engine::logic_registry::all_contained_with_env(&decoded.logic_deps, env) {
+        *entry = FnCallMemoEntry::Ready(None);
+        return Ok(());
+    }
+    if !decoded.child_components.is_empty() {
+        // Legacy entry with stored child component paths. Invalidate so the
+        // function re-runs, detects child components, and the entry is
+        // cleaned up.
+        *entry = FnCallMemoEntry::Ready(None);
+        return Ok(());
+    }
+    let db_schema::MemoizedValue::Inlined(return_value_bytes) = decoded.return_value;
+    let ret = Prof::FunctionData::from_bytes(return_value_bytes.as_ref())?;
+    let memo_states = deserialize_memo_values::<Prof>(&decoded.memo_states)?;
+    let context_memo_states =
+        deserialize_context_memo_states::<Prof>(&decoded.context_memo_states)?;
+    *entry = FnCallMemoEntry::Ready(Some(FnCallMemo {
+        ret,
+        target_state_paths: decoded.target_state_paths,
+        target_provider_deps: decoded.target_provider_deps.into_iter().collect(),
+        dependency_memo_entries: decoded.dependency_memo_entries.into_iter().collect(),
+        logic_deps: decoded.logic_deps.into_iter().collect(),
+        memo_states,
+        context_memo_states,
+        data_deps: decode_data_deps(decoded.data_deps),
+        persisted: true,
+        reused: true,
+    }));
+    Ok(())
+}
+
+/// Lifecycle state of one user-state key within a single component build.
+///
+/// Generic over the stored value type `D`, which the engine instantiates as
+/// `Prof::FunctionData` (= `PyStoredValue` in the Python profile). `PyStoredValue`
+/// holds both the Python object and serialized bytes lazily behind an
+/// `Arc<Mutex<...>>`, so cloning is a cheap refcount bump, deserialization from
+/// bytes happens once on first access, and serialization to bytes happens once at
+/// flush (`into_flush_plan`).
+enum UserStateEntry<D> {
+    /// Prefetched from DB at build start; `use_state()` not yet called for
+    /// this key. Deleted at flush time if it stays in this state (set-reduction path).
+    Loaded(D),
+    /// Claimed by `use_state()` and optionally overwritten by
+    /// `update_declared()`. Written to DB at flush time.
+    Declared(D),
+}
+
+/// Per-component user state cache for a single build.
+///
+/// Mirrors the `FnMemoCache` pattern: `populate` fills it from a
+/// standalone read at build start, then `use_state` / `update_declared`
+/// accumulate the declared states, and `into_flush_plan` produces the diff
+/// that is applied atomically via [`CommitPlan`].
+/// At flush time only keys re-declared or newly declared by the user
+/// during this build through use_state() survive: `Declared` entries are
+/// written to DB and `Loaded` entries (present in the previous build but
+/// not re-declared this build) are deleted.
+pub(crate) struct UserStateCache<D> {
+    /// All entries seen this build. Prefetched entries start as `Loaded` and
+    /// transition to `Declared` when claimed by `use_state()`; brand-new keys
+    /// start directly as `Declared`.
+    entries: HashMap<StableKey, UserStateEntry<D>>,
+    /// True after a successful `populate`;
+    /// False under `full_reprocess` (prefetch skipped).
+    ///
+    /// When true: stale `Loaded` entries are individually deleted.
+    /// When false: all existing `Regular` entries are wiped upfront via
+    /// `delete_user_states_of_kind` before writing.
+    is_loaded: bool,
+}
+
+impl<D: Persist + Clone> UserStateCache<D> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            is_loaded: false,
+        }
+    }
+
+    pub(crate) fn is_loaded(&self) -> bool {
+        self.is_loaded
+    }
+
+    /// Wrap each prefetched DB row as a `Loaded` entry. The bytes are decoded
+    /// into `D` (for the Python profile, `PyStoredValue::from_bytes` — a
+    /// bytes-backed cell that defers deserialization until first access).
+    pub(crate) fn populate(&mut self, rows: Vec<(StableKey, Vec<u8>)>) -> Result<()> {
+        self.entries = rows
+            .into_iter()
+            .map(|(k, bytes)| Ok((k, UserStateEntry::Loaded(D::from_bytes(&bytes)?))))
+            .collect::<Result<_>>()?;
+        self.is_loaded = true;
+        Ok(())
+    }
+
+    /// Register `key` as declared for this build. Returns the previously
+    /// stored value (if any) or `initial_value`. Errors on duplicate keys.
+    /// Called when the user calls coco.use_state("key", initial_value)
+    pub(crate) fn use_state(&mut self, key: StableKey, initial_value: D) -> Result<D> {
+        use std::collections::hash_map::Entry;
+        match self.entries.entry(key) {
+            Entry::Occupied(mut e) => match e.get() {
+                UserStateEntry::Declared(_) => {
+                    already_declared_bail!(
+                        "use_state key {:?} declared more than once in the same component run",
+                        e.key()
+                    );
+                }
+                UserStateEntry::Loaded(v) => {
+                    let value = v.clone();
+                    e.insert(UserStateEntry::Declared(value.clone()));
+                    Ok(value)
+                }
+            },
+            Entry::Vacant(e) => {
+                e.insert(UserStateEntry::Declared(initial_value.clone()));
+                Ok(initial_value)
+            }
+        }
+    }
+
+    /// Update the current value for an already-declared key. Called when
+    /// the user sets `my_state.value = ...`.
+    pub(crate) fn update_declared(&mut self, key: &StableKey, value: D) -> Result<()> {
+        match self.entries.get_mut(key) {
+            Some(UserStateEntry::Declared(v)) => {
+                *v = value;
+                Ok(())
+            }
+            _ => {
+                client_bail!(
+                    "use_state key {:?} has not been declared via use_state in this component run",
+                    key
+                );
+            }
+        }
+    }
+
+    /// Drain the cache into a serialized plan for inclusion in [`CommitPlan`].
+    /// Mirrors [`FnMemoCache::into_flush_plan`]. Serialization of each surviving
+    /// `Declared` value to bytes happens here — once per key, at commit time.
+    pub(crate) fn into_flush_plan(self) -> Result<UserStateFlushPlan> {
+        let mut plan = UserStateFlushPlan {
+            clear_all_first: !self.is_loaded,
+            writes: Vec::new(),
+            deletes: Vec::new(),
+        };
+        for (key, entry) in self.entries {
+            match entry {
+                UserStateEntry::Loaded(_) if self.is_loaded => plan.deletes.push(key),
+                UserStateEntry::Declared(value) => {
+                    // Serialization is deferred to here, so a non-serializable
+                    // state value surfaces at commit. Attach the key so the
+                    // error identifies which `use_state` value failed.
+                    let bytes = value.to_bytes().with_context(|| {
+                        format!("failed to serialize user state for key {key:?}")
+                    })?;
+                    plan.writes.push((key, bytes.to_vec()));
+                }
+                _ => {}
+            }
+        }
+        Ok(plan)
+    }
+}
+
+/// Serialized diff produced by [`UserStateCache::into_flush_plan`].
+/// Included in [`CommitPlan`] so the AppStore can apply it atomically.
+pub(crate) struct UserStateFlushPlan {
+    pub(crate) clear_all_first: bool,
+    pub(crate) writes: Vec<(StableKey, Vec<u8>)>,
+    pub(crate) deletes: Vec<StableKey>,
+}
+
+pub(crate) struct ComponentBuildingState<Prof: EngineProfile> {
+    pub target_states: ComponentTargetStatesContext<Prof>,
+    pub child_path_set: ChildStablePathSet,
+    pub fn_memos: FnMemoCache<Prof>,
+    pub user_states: UserStateCache<Prof::FunctionData>,
+}
+
+/// Shared collector for preview actions across all components in a single update.
+pub(crate) type PreviewActionCollector<Prof> =
+    Arc<std::sync::Mutex<Vec<<Prof as EngineProfile>::TargetAction>>>;
+
+pub(crate) struct ComponentBuildContext<Prof: EngineProfile> {
+    pub state: Mutex<Option<ComponentBuildingState<Prof>>>,
+    pub full_reprocess: bool,
+    pub live: bool,
+    /// default (e.g. root `App.update`, `use_mount`'s foreground path,
+    /// `mount_inner_live`'s self-built parent context).
+    pub on_error: Option<crate::engine::component::OnError>,
+    pub preview_collector: Option<PreviewActionCollector<Prof>>,
+    /// The selector this run is under, scoped by
+    /// [`ComponentSelector::scoped_to`]. See
+    /// [`ComponentProcessorContext::component_selector`].
+    pub component_selector: Option<ComponentSelector>,
+}
+
+/// A change a run refused because the update's selector leaves out components
+/// it would affect: the rebuild or removal of a container target state whose
+/// children the update does not run. The run fails, and the update fails with
+/// the same error when it ends, wherever the run was: a background component's
+/// failure alone only reaches its error handler, and a caller that previews a
+/// slice and then updates it must see the refusal from both.
+#[derive(Clone, Default)]
+pub(crate) struct UpdateRefusal(Arc<parking_lot::Mutex<Option<String>>>);
+
+impl UpdateRefusal {
+    /// Keep the first refusal: it is the one the update reports.
+    pub(crate) fn record(&self, message: &str) {
+        self.0.lock().get_or_insert_with(|| message.to_string());
+    }
+
+    pub(crate) fn take(&self) -> Option<String> {
+        self.0.lock().take()
+    }
+}
+
+pub(crate) struct ComponentDeleteContext<Prof: EngineProfile> {
+    pub providers: rpds::HashTrieMapSync<TargetStatePath, TargetStateProvider<Prof>>,
+    /// Error handler that cascades through descendant deletes triggered
+    /// by this delete's GC sweep. `App.drop()` installs a raising handler
+    /// at the root; it propagates down so any descendant failure surfaces
+    /// back through `handle.ready()` to the awaiting caller. `None`
+    /// preserves the "log + swallow" default for callers that don't need
+    /// propagation (e.g. `operator.delete` without a user-installed
+    /// raising handler).
+    ///
+    /// See `specs/core/error_handling.md` for the unified principle.
+    pub on_error: Option<crate::engine::component::OnError>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComponentProcessingMode {
+    Build,
+    Delete,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one per component run, matched once; boxing would only add an allocation"
+)]
+pub(crate) enum ComponentProcessingAction<Prof: EngineProfile> {
+    Build(ComponentBuildContext<Prof>),
+    Delete(ComponentDeleteContext<Prof>),
+}
+
+impl<Prof: EngineProfile> ComponentProcessingAction<Prof> {
+    pub fn new_build(
+        providers: rpds::HashTrieMapSync<TargetStatePath, TargetStateProvider<Prof>>,
+        full_reprocess: bool,
+        live: bool,
+        on_error: Option<crate::engine::component::OnError>,
+        preview_collector: Option<PreviewActionCollector<Prof>>,
+        component_selector: Option<ComponentSelector>,
+    ) -> Self {
+        Self::Build(ComponentBuildContext {
+            state: Mutex::new(Some(ComponentBuildingState {
+                target_states: ComponentTargetStatesContext {
+                    declared_target_states: Default::default(),
+                    provider_registry: TargetStateProviderRegistry::new(providers),
+                },
+                child_path_set: Default::default(),
+                fn_memos: FnMemoCache::new(),
+                user_states: UserStateCache::new(),
+            })),
+            full_reprocess,
+            live,
+            on_error,
+            preview_collector,
+            component_selector,
+        })
+    }
+
+    pub fn new_delete(
+        providers: rpds::HashTrieMapSync<TargetStatePath, TargetStateProvider<Prof>>,
+        on_error: Option<crate::engine::component::OnError>,
+    ) -> Self {
+        Self::Delete(ComponentDeleteContext {
+            providers,
+            on_error,
+        })
+    }
+}
+
+struct ComponentProcessorContextInner<Prof: EngineProfile> {
+    component: Component<Prof>,
+    parent_context: Option<ComponentProcessorContext<Prof>>,
+    processing_action: ComponentProcessingAction<Prof>,
+    /// See [`ComponentProcessorContext::app_store`].
+    app_store: AppStore,
+    /// See [`ComponentProcessorContext::operation_generation`].
+    operation_generation: u64,
+
+    /// This run's in-flight token and the lender its children borrow from;
+    /// see [`crate::engine::admission`].
+    admission: Admission,
+
+    /// Where a run of this update records that it refused a change for the
+    /// selector's sake (see [`UpdateRefusal`]). One per update: every context
+    /// of the update shares it, live components' runs included.
+    update_refusal: UpdateRefusal,
+
+    /// This run's selector left out a child it mounted or one the store holds,
+    /// so this subtree is not up to date when the run ends. Set by a mount, by
+    /// the commit's existence reconciliation and by its GC sweep.
+    left_out_children: Arc<AtomicBool>,
+
+    /// Logic fingerprints accumulated from function calls and child components.
+    logic_deps: Mutex<HashSet<Fingerprint>>,
+
+    /// Data dependencies this component's own run recorded (its top-level
+    /// function frame and the frames beneath it). Never a child component's:
+    /// a child reports one bit instead (`ComponentRunOutcome::cannot_skip`).
+    data_deps: Mutex<DataDeps>,
+
+    /// Target-state provider generations this component declared against,
+    /// accumulated from its own declarations and from child components. Stored
+    /// with this component's memo entry and re-checked on the next probe.
+    target_provider_deps: Mutex<TargetProviderDeps>,
+
+    /// Opaque per-operation context (e.g. ContextProvider on the Python side).
+    host_ctx: Arc<Prof::HostCtx>,
+}
+
+/// A `ComponentProcessorContext` is a thin view over a shared `inner`
+/// (component identity, building state, providers, admission — never forked)
+/// plus three
+/// **per-view** fields that a `stats_group` substitutes: the stats bucket, the
+/// child-readiness accumulator, and the enclosing-group list for liveness.
+/// `Clone` shares everything (all `Arc`-based handles), so an unscoped clone is
+/// byte-for-byte equivalent; only `with_stats_group` produces a divergent view.
+#[derive(Clone)]
+pub struct ComponentProcessorContext<Prof: EngineProfile> {
+    inner: Arc<ComponentProcessorContextInner<Prof>>,
+    /// Where this view's components report stats (root's, or a group's).
+    processing_stats: ProcessingStats,
+    /// Where children mounted under this view register their readiness.
+    components_readiness: ComponentBgChildReadiness,
+    /// Enclosing stats groups, outermost-first, for live-member liveness
+    /// fan-out. Empty for the root / unscoped views.
+    stats_groups: Arc<Vec<Arc<StatsGroup<Prof>>>>,
+}
+
+impl<Prof: EngineProfile> ComponentProcessorContext<Prof> {
+    /// A context whose run borrows its in-flight token from `parent_context`'s
+    /// run and belongs to its update. Without a parent, the run is an
+    /// app-level update of its own.
+    pub(crate) fn new(
+        component: Component<Prof>,
+        parent_context: Option<ComponentProcessorContext<Prof>>,
+        processing_stats: ProcessingStats,
+        host_ctx: Arc<Prof::HostCtx>,
+        processing_action: ComponentProcessingAction<Prof>,
+    ) -> Self {
+        let (lender, share) = match &parent_context {
+            Some(parent) => (
+                Some(parent.admission().lender().clone()),
+                parent.admission().share().clone(),
+            ),
+            None => (None, component.app_ctx().admission_pool().new_update()),
+        };
+        // A run's store handle is its parent's, so every context of one
+        // operation — children, the deletes its commit launches, the live
+        // components it mounts — shares the root's: the app's persisting
+        // store, or in a preview one handle whose writes never persist.
+        let app_store = match &parent_context {
+            Some(parent) => parent.app_store().clone(),
+            None => match &processing_action {
+                ComponentProcessingAction::Build(build_ctx)
+                    if build_ctx.preview_collector.is_some() =>
+                {
+                    component
+                        .app_ctx()
+                        .persisting_app_store()
+                        .discarding_writes()
+                }
+                ComponentProcessingAction::Build(_) | ComponentProcessingAction::Delete(_) => {
+                    component.app_ctx().persisting_app_store().clone()
+                }
+            },
+        };
+        Self::from_parts(
+            component,
+            parent_context,
+            Admission::new(share, lender),
+            processing_stats,
+            host_ctx,
+            processing_action,
+            app_store,
+            None,
+        )
+    }
+
+    /// A context for a run of a live component: it has no parent context and
+    /// is an update of its own (`share`, from the live component's share).
+    /// It borrows its in-flight token from `lender`, the run that mounted the
+    /// live component, for as long as that run lasts, and reads and writes
+    /// the store through `app_store`, that run's handle.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_borrowing_from(
+        component: Component<Prof>,
+        lender: Option<Lender>,
+        share: UpdateShare,
+        processing_stats: ProcessingStats,
+        host_ctx: Arc<Prof::HostCtx>,
+        processing_action: ComponentProcessingAction<Prof>,
+        app_store: AppStore,
+        update_refusal: UpdateRefusal,
+    ) -> Self {
+        Self::from_parts(
+            component,
+            None,
+            Admission::new(share, lender),
+            processing_stats,
+            host_ctx,
+            processing_action,
+            app_store,
+            Some(update_refusal),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_parts(
+        component: Component<Prof>,
+        parent_context: Option<ComponentProcessorContext<Prof>>,
+        admission: Admission,
+        processing_stats: ProcessingStats,
+        host_ctx: Arc<Prof::HostCtx>,
+        processing_action: ComponentProcessingAction<Prof>,
+        app_store: AppStore,
+        update_refusal: Option<UpdateRefusal>,
+    ) -> Self {
+        let update_refusal = match (&parent_context, update_refusal) {
+            (Some(parent), _) => parent.update_refusal().clone(),
+            (None, Some(update_refusal)) => update_refusal,
+            (None, None) => UpdateRefusal::default(),
+        };
+        let operation_generation = match &parent_context {
+            Some(parent) => parent.operation_generation(),
+            None => component.app_ctx().next_operation_generation(),
+        };
+        Self {
+            inner: Arc::new(ComponentProcessorContextInner {
+                component,
+                parent_context,
+                processing_action,
+                app_store,
+                operation_generation,
+                admission,
+                update_refusal,
+                left_out_children: Arc::new(AtomicBool::new(false)),
+                logic_deps: Mutex::new(HashSet::new()),
+                data_deps: Mutex::new(DataDeps::default()),
+                target_provider_deps: Mutex::new(TargetProviderDeps::new()),
+                host_ctx,
+            }),
+            processing_stats,
+            components_readiness: Default::default(),
+            stats_groups: Arc::new(Vec::new()),
+        }
+    }
+
+    /// Derive a sibling view that reports into `group`'s stats, registers child
+    /// readiness into `group`'s readiness, and appends `group` to the
+    /// enclosing-group list (for live-member liveness). Shares `inner` — so
+    /// component identity, building state, providers, and admission are
+    /// unchanged.
+    pub(crate) fn with_stats_group(&self, group: &Arc<StatsGroup<Prof>>) -> Self {
+        let mut stats_groups = Vec::with_capacity(self.stats_groups.len() + 1);
+        stats_groups.extend(self.stats_groups.iter().cloned());
+        stats_groups.push(group.clone());
+        Self {
+            inner: self.inner.clone(),
+            processing_stats: group.stats().clone(),
+            components_readiness: group.readiness().clone(),
+            stats_groups: Arc::new(stats_groups),
+        }
+    }
+
+    /// Register a child whose processing task is starting as a member of every
+    /// enclosing stats group, so each group's liveness tracking sees it (and,
+    /// since activity propagates up the parent chain, its whole subtree).
+    /// No-op when not in a group.
+    pub(crate) fn push_active_member(&self, child: &Component<Prof>) {
+        for group in self.stats_groups.iter() {
+            group.push_member(child);
+        }
+    }
+
+    pub fn host_ctx(&self) -> &Arc<Prof::HostCtx> {
+        &self.inner.host_ctx
+    }
+
+    pub fn component(&self) -> &Component<Prof> {
+        &self.inner.component
+    }
+
+    pub fn app_ctx(&self) -> &AppContext<Prof> {
+        self.inner.component.app_ctx()
+    }
+
+    /// The app's state store as this run reads and writes it, shared with
+    /// every other context of the same operation. In a preview it is a handle
+    /// that persists nothing (see [`AppStore::discarding_writes`]): the run
+    /// reads its own writes back and plans as an update would, and that is
+    /// what makes a preview write nothing — its write paths need no check of
+    /// their own. Component runs reach the store through here, not through
+    /// [`AppContext::persisting_app_store`].
+    pub(crate) fn app_store(&self) -> &AppStore {
+        &self.inner.app_store
+    }
+
+    pub fn stable_path(&self) -> &StablePath {
+        self.inner.component.stable_path()
+    }
+
+    /// Eagerly load every function-memo and user-state entry for this
+    /// component from storage into the per-build cache. Called at the start
+    /// of build mode before any function calls run, so every subsequent
+    /// fn-call probe and `use_state` serves from memory. Skipped under
+    /// `full_reprocess` so both caches stay empty and `into_flush_plan`
+    /// produces a clear-all plan followed by writes of newly-computed entries.
+    ///
+    /// Both ranges are read under a single LMDB read transaction: under
+    /// `MDB_NOTLS` every read-txn begin takes the reader-table mutex, so
+    /// one snapshot instead of two halves that cost — most visibly during
+    /// `mount_each` fan-out, where many child components prefetch at once
+    /// (it also halves concurrent reader-slot occupancy against LMDB's
+    /// `MDB_READERS_FULL` limit).
+    pub(crate) async fn prefetch_states(&self) -> Result<()> {
+        if self.full_reprocess() {
+            return Ok(());
+        }
+        // Cheap check: skip if already loaded (re-entry, etc.). The two
+        // caches are always prefetched together, so they load as a pair.
+        let already_loaded = match &self.inner.processing_action {
+            ComponentProcessingAction::Build(build_ctx) => {
+                let guard = build_ctx.state.lock().unwrap();
+                let Some(state) = guard.as_ref() else {
+                    return Ok(());
+                };
+                state.fn_memos.is_fully_loaded() && state.user_states.is_loaded()
+            }
+            ComponentProcessingAction::Delete { .. } => return Ok(()),
+        };
+        if already_loaded {
+            return Ok(());
+        }
+        let (fn_memo_rows, user_state_rows) = self
+            .app_store()
+            .prefetch_fn_processing_states(self.stable_path())
+            .await?;
+        self.update_building_state(|s| {
+            s.fn_memos.populate(fn_memo_rows);
+            s.user_states.populate(user_state_rows)?;
+            Ok(())
+        })
+    }
+
+    /// Register `key` as a user state for this build and return its current
+    /// value. On first call for a key, the stored value (if any) is returned;
+    /// otherwise `initial_value` is used. Duplicate keys within the same
+    /// component run are an error.
+    /// Called when the user calls coco.use_state("key", initial_value)
+    pub fn use_state(
+        &self,
+        key: StableKey,
+        initial_value: Prof::FunctionData,
+    ) -> Result<Prof::FunctionData> {
+        self.update_building_state(|s| s.user_states.use_state(key, initial_value))
+    }
+
+    /// Update the current value for an already-declared user state key.
+    /// Called when the user sets `my_state.value = ...`.
+    pub fn update_user_state(&self, key: &StableKey, value: Prof::FunctionData) -> Result<()> {
+        self.update_building_state(|s| s.user_states.update_declared(key, value))
+    }
+
+    pub(crate) fn parent_context(&self) -> Option<&ComponentProcessorContext<Prof>> {
+        self.inner.parent_context.as_ref()
+    }
+
+    /// The target-state providers visible to this component: everything
+    /// inherited from ancestors at mount time plus anything its own subtree has
+    /// built so far. Cloning is O(1) — the map is structurally shared.
+    pub(crate) fn target_states_providers(
+        &self,
+    ) -> Result<rpds::HashTrieMapSync<TargetStatePath, TargetStateProvider<Prof>>> {
+        self.update_building_state(|building_state| {
+            Ok(building_state
+                .target_states
+                .provider_registry
+                .providers
+                .clone())
+        })
+    }
+
+    /// Access the building state under a single lock acquisition.
+    /// Callers should access all needed fields within `f` rather than wrapping
+    /// this in convenience methods — the caller decides the lock granularity.
+    pub(crate) fn update_building_state<T>(
+        &self,
+        f: impl FnOnce(&mut ComponentBuildingState<Prof>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Build(build_ctx) => {
+                let mut building_state = build_ctx.state.lock().unwrap();
+                let Some(building_state) = &mut *building_state else {
+                    internal_bail!(
+                        "Processing for the component at {} is already finished",
+                        self.stable_path()
+                    );
+                };
+                f(building_state)
+            }
+            ComponentProcessingAction::Delete { .. } => {
+                internal_bail!(
+                    "Processing for the component at {} is for deletion only",
+                    self.stable_path()
+                )
+            }
+        }
+    }
+
+    pub(crate) fn processing_state(&self) -> &ComponentProcessingAction<Prof> {
+        &self.inner.processing_action
+    }
+
+    pub fn components_readiness(&self) -> &ComponentBgChildReadiness {
+        &self.components_readiness
+    }
+
+    pub(crate) fn mode(&self) -> ComponentProcessingMode {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Build(_) => ComponentProcessingMode::Build,
+            ComponentProcessingAction::Delete { .. } => ComponentProcessingMode::Delete,
+        }
+    }
+
+    /// Clone of the `on_error` handler installed at the context's creation,
+    /// available for both Build- and Delete-mode contexts.
+    ///
+    /// Read by:
+    /// - `Component::delete`'s spawned task (Delete only — invoke on this
+    ///   component's own failure).
+    /// - The commit-phase GC sweep (both modes — cascade to descendant
+    ///   deletes triggered by this component's submit/commit).
+    ///
+    /// For Delete-mode (`App.drop`'s root), the raising handler installed
+    /// at root cascades down through every recursive delete. For Build-mode
+    /// (a `coco.mount` child whose `process()` no longer declares a
+    /// previously-existing grandchild), the child's user-installed
+    /// exception handler chain — wired through `Component::mount`'s
+    /// `on_error` parameter — sees orphan-delete failures from the
+    /// commit-phase GC sweep.
+    ///
+    /// Returns `None` when no handler was installed (e.g. root `App.update`,
+    /// `use_mount`'s foreground path, `operator.delete` without a
+    /// user-installed raising handler).
+    pub(crate) fn processing_action_on_error(&self) -> Option<crate::engine::component::OnError> {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Build(b) => b.on_error.clone(),
+            ComponentProcessingAction::Delete(d) => d.on_error.clone(),
+        }
+    }
+
+    /// Delete-mode-only on_error accessor. Used by `Component::delete`'s
+    /// spawned task to invoke the handler on this component's own
+    /// execution failure (a *Build*-context's on_error is meant for
+    /// orphan-delete cascades, not for invoking on the build's own
+    /// failure — that flows through the `on_error` argument to
+    /// `run_in_background` directly).
+    pub(crate) fn delete_action_on_error(&self) -> Option<crate::engine::component::OnError> {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Delete(d) => d.on_error.clone(),
+            ComponentProcessingAction::Build(_) => None,
+        }
+    }
+
+    /// Join a function frame that ran directly under this component (its
+    /// top-level function, or a state handler's frame) into the component.
+    ///
+    /// The component boundary flattens every kind of logic dep the frame holds
+    /// into the component's single `logic_deps` set — including tunneled sets
+    /// still addressed to an owner. Component-tree propagation applies no
+    /// `logic_tracking` mode, and the function frames that could resolve a
+    /// tunneled set are all closed before child outcomes reach a parent
+    /// component, so a tagged set at this level could never be resolved and
+    /// would be observably identical to the flattened one.
+    pub fn join_fn_call(&self, fn_ctx: &FnCallContext) {
+        let (logic_deps, target_provider_deps, data_deps) = fn_ctx.update(|inner| {
+            (
+                inner.entry_logic_deps().collect::<Vec<_>>(),
+                inner.target_provider_deps.clone(),
+                std::mem::take(&mut inner.data_deps),
+            )
+        });
+        fn_ctx.close();
+        self.inner.logic_deps.lock().unwrap().extend(logic_deps);
+        self.merge_target_provider_deps(target_provider_deps);
+        self.inner.data_deps.lock().unwrap().merge(data_deps);
+    }
+
+    /// Merge target-provider generation deps (from this component's own
+    /// declarations, or propagated up from a mounted child) into this
+    /// component's set.
+    pub(crate) fn merge_target_provider_deps(
+        &self,
+        deps: impl IntoIterator<Item = (TargetStatePath, TargetStateProviderGeneration)>,
+    ) {
+        self.inner.target_provider_deps.lock().unwrap().extend(deps);
+    }
+
+    /// Take the accumulated target-provider deps out of this context. Like
+    /// [`take_logic_deps`](Self::take_logic_deps), the single set serves both
+    /// this component's own memo entry and the `ComponentRunOutcome` reported
+    /// to the parent — a parent that memo-hits never mounts its children, so it
+    /// must carry their provider deps to catch an invalidation on their behalf.
+    pub(crate) fn take_target_provider_deps(&self) -> TargetProviderDeps {
+        std::mem::take(&mut *self.inner.target_provider_deps.lock().unwrap())
+    }
+
+    /// Merge additional logic deps (e.g. from child components) into this component's set.
+    pub(crate) fn merge_logic_deps(&self, deps: impl IntoIterator<Item = Fingerprint>) {
+        self.inner.logic_deps.lock().unwrap().extend(deps);
+    }
+
+    /// Take the accumulated logic deps (own fp ∪ all descendants merged so far)
+    /// out of this context. This is an O(1) move — the single full set serves
+    /// both consumers in `execute_once`: this component's own memo (sorted for
+    /// deterministic storage at the call site) and the `ComponentRunOutcome`
+    /// reported to the parent across the mount boundary (so the parent's memo
+    /// depends on this whole subtree's logic). Callers must invoke this only
+    /// after everything that reads the set (e.g. `collect_context_initial_states`
+    /// during cache-miss memo-state collection) has run.
+    pub(crate) fn take_logic_deps(&self) -> HashSet<Fingerprint> {
+        std::mem::take(&mut *self.inner.logic_deps.lock().unwrap())
+    }
+
+    /// Take the data dependencies this component's own run recorded. Like
+    /// [`take_logic_deps`](Self::take_logic_deps), an O(1) move for the store.
+    pub(crate) fn take_data_deps(&self) -> DataDeps {
+        std::mem::take(&mut *self.inner.data_deps.lock().unwrap())
+    }
+
+    /// Collect initial memo states for the change-detection context fingerprints
+    /// observed so far (stored in this component's `logic_deps`), by looking
+    /// them up in the env's eager-initial-states registry.
+    ///
+    /// Used by the Python memoization layer on cache miss to populate a new
+    /// entry's `context_memo_states` in a single Rust call, without
+    /// snapshotting `logic_deps` to Python and doing per-entry lookups there.
+    pub fn collect_context_initial_states(&self) -> Vec<(Fingerprint, Vec<Prof::FunctionData>)> {
+        let deps = self.inner.logic_deps.lock().unwrap();
+        self.app_ctx()
+            .env()
+            .collect_context_initial_states(deps.iter())
+    }
+
+    /// This run's admission: its in-flight token and the lender its children
+    /// borrow from.
+    pub(crate) fn admission(&self) -> &Admission {
+        &self.inner.admission
+    }
+
+    pub fn processing_stats(&self) -> &ProcessingStats {
+        &self.processing_stats
+    }
+
+    pub fn full_reprocess(&self) -> bool {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Build(build_ctx) => build_ctx.full_reprocess,
+            ComponentProcessingAction::Delete { .. } => false,
+        }
+    }
+
+    /// Generation of the operation this context belongs to. A context created
+    /// without a parent — the root of an `App::update` or `App::drop_app`, or
+    /// a live component's own cycle — starts a new operation; children inherit
+    /// their parent's. So two runs of one component share a generation exactly
+    /// when the same operation started both, which is how `full_reprocess`
+    /// tells a memo stored earlier in the same operation (that operation's own
+    /// execution) from one left behind by a previous run (a cache it must
+    /// ignore). See `Component::execute_once`.
+    pub(crate) fn operation_generation(&self) -> u64 {
+        self.inner.operation_generation
+    }
+
+    /// The collector of a preview run's actions. Only a build runs as a
+    /// preview: a preview plans no deletes of components.
+    pub(crate) fn preview_collector(&self) -> Option<&PreviewActionCollector<Prof>> {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Build(build_ctx) => build_ctx.preview_collector.as_ref(),
+            ComponentProcessingAction::Delete(_) => None,
+        }
+    }
+
+    /// The selector this run is under. A delete has none: it is reached only
+    /// for a path a selector covers, and removes everything below.
+    pub(crate) fn component_selector(&self) -> Option<&ComponentSelector> {
+        match self.processing_state() {
+            ComponentProcessingAction::Build(build_ctx) => build_ctx.component_selector.as_ref(),
+            ComponentProcessingAction::Delete(_) => None,
+        }
+    }
+
+    /// The update this run belongs to leaves some components out, wherever this
+    /// run is: inside a selected subtree too. A change this run makes can reach
+    /// those components through what they share, as a container target state.
+    /// A delete does not count: the component it removes is selected and gone,
+    /// so nothing can declare under its containers any more.
+    pub(crate) fn update_leaves_out_components(&self) -> bool {
+        self.component_selector()
+            .is_some_and(|selector| !selector.selects_everything())
+    }
+
+    pub(crate) fn update_refusal(&self) -> &UpdateRefusal {
+        &self.inner.update_refusal
+    }
+
+    pub(crate) fn mark_left_out_children(&self) {
+        self.inner.left_out_children.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn left_out_children(&self) -> bool {
+        self.inner.left_out_children.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn left_out_children_flag(&self) -> Arc<AtomicBool> {
+        self.inner.left_out_children.clone()
+    }
+
+    /// Record a mount at `path` that the selector leaves out. It counts as a
+    /// mount of this run, so a second mount at the path is an error as usual,
+    /// and a directory it lies under counts as declared.
+    pub(crate) fn record_skipped_mount(&self, path: &StablePath) -> Result<()> {
+        self.mark_left_out_children();
+        let sub_path = path.as_ref().strip_parent(self.stable_path().as_ref())?;
+        self.update_building_state(|building_state| {
+            building_state
+                .child_path_set
+                .add_child(sub_path, StablePathSet::Skipped)
+        })
+    }
+
+    /// Whether the selector leaves out a mount at `path`, without recording
+    /// anything: for a host that prepares a mount it would then hand to
+    /// [`Component::mount`], which records the skip itself.
+    pub fn selector_leaves_out(&self, path: &StablePath) -> bool {
+        self.component_selector()
+            .is_some_and(|selector| selector.classify(path) == ComponentSelection::Unselected)
+    }
+
+    /// Whether the selector leaves out a mount at `path`, recording it if so.
+    /// For a host that wants to know before it prepares the mount: building a
+    /// processor can run user code, and costs per item. [`Component::mount`]
+    /// and `mount_live_prepare` decide alike for one that does not ask.
+    pub fn skips_mount(&self, fn_ctx: &FnCallContext, path: &StablePath) -> Result<bool> {
+        let Some(selector) = self.component_selector() else {
+            return Ok(false);
+        };
+        if selector.classify(path) != ComponentSelection::Unselected {
+            return Ok(false);
+        }
+        // Even a skipped child rules out memoizing the function that mounted it.
+        fn_ctx.update(|inner| inner.has_child_components = true);
+        self.record_skipped_mount(path)?;
+        Ok(true)
+    }
+
+    /// The keys a mount of one component per key under `path` (`mount_each`)
+    /// can run: `None` for every key, else only these, which may be none. A
+    /// host that gets a list need not list its source in full: it can read
+    /// just these keys, and with an empty list it need not read at all. The
+    /// run records that it leaves the other keys out, as
+    /// [`Self::skips_mount`] records one skip.
+    pub fn mount_each_keys(
+        &self,
+        fn_ctx: &FnCallContext,
+        path: &StablePath,
+    ) -> Option<Vec<StableKey>> {
+        let keys = self.component_selector()?.selected_child_keys(path)?;
+        fn_ctx.update(|inner| inner.has_child_components = true);
+        self.mark_left_out_children();
+        Some(keys)
+    }
+
+    pub fn live(&self) -> bool {
+        match &self.inner.processing_action {
+            ComponentProcessingAction::Build(build_ctx) => build_ctx.live,
+            ComponentProcessingAction::Delete { .. } => false,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FnCallContextInner {
+    /// Target states that are declared by the function.
+    pub target_state_paths: Vec<TargetStatePath>,
+    /// Generations of the providers those target states were declared against.
+    /// Re-checked when this call's memo entry is probed — see
+    /// [`TargetProviderDeps`].
+    pub target_provider_deps: TargetProviderDeps,
+    /// Dependency entries that are declared by the function. Only needs to keep dependencies with side effects (target states / dependency entries with side effects).
+    pub dependency_memo_entries: HashSet<Fingerprint>,
+
+    /// Whether the function (directly or transitively) mounted any child components.
+    /// If true, function-level memoization is disabled for this call.
+    pub has_child_components: bool,
+
+    /// Function logic fingerprints (mode-controlled propagation via `propagate_children_fn_logic`).
+    pub fn_logic_deps: HashSet<Fingerprint>,
+    /// Context key fingerprints (always propagate regardless of logic_tracking mode).
+    pub context_change_deps: HashSet<Fingerprint>,
+
+    /// Logic fingerprints offered by tunneled callbacks, keyed by the frame that
+    /// created the tunnel (the owner). They ride through `join_child` regardless
+    /// of `propagate_children_fn_logic`, are stored in every memo entry on the
+    /// way, and are resolved into ordinary child deps when they reach the owner.
+    /// See [`FnCallContext::join_tunneled_child`].
+    pub tunneled_fn_logic_deps: HashMap<FnFrameId, HashSet<Fingerprint>>,
+    /// Logic fingerprints recorded into this frame's memo entry only, never
+    /// offered to the parent: tunneled deps that resolved at this frame as
+    /// their owner while its `propagate_children_fn_logic` is false.
+    pub entry_only_fn_logic_deps: HashSet<Fingerprint>,
+    /// Logic fingerprints a memo hit re-offered from a callee's stored entry
+    /// ([`FnCallMemoGuard::join_cached_logic_deps`](super::function::FnCallMemoGuard::join_cached_logic_deps)).
+    /// A stored entry's set is flat — the callee's own and propagated logic,
+    /// tunneled sets and context-change deps, flattened when it was stored —
+    /// so the kinds cannot be told apart again. The set rides to the
+    /// enclosing component's entry through every frame regardless of mode,
+    /// as the tunneled and context-change parts would have on a miss; a
+    /// `"self"` frame therefore records more after a hit than after a miss
+    /// (its callee's own logic too) — more invalidation, never a stale entry.
+    pub reoffered_logic_deps: HashSet<Fingerprint>,
+    /// Data dependencies recorded in this frame and the frames beneath it.
+    /// They ride up through every frame regardless of `logic_tracking`, as
+    /// `context_change_deps` do: they describe what the call read, not its code.
+    pub data_deps: DataDeps,
+}
+
+impl FnCallContextInner {
+    /// Every logic dependency this frame's memo entry records: own and
+    /// propagated function logic, entry-only recordings, tunneled sets still
+    /// in transit, and context-change deps.
+    pub fn entry_logic_deps(&self) -> impl Iterator<Item = Fingerprint> + '_ {
+        self.fn_logic_deps
+            .iter()
+            .chain(self.entry_only_fn_logic_deps.iter())
+            .chain(self.reoffered_logic_deps.iter())
+            .chain(self.tunneled_fn_logic_deps.values().flatten())
+            .chain(self.context_change_deps.iter())
+            .copied()
+    }
+}
+
+/// Process-unique identity of one [`FnCallContext`]. A tunneled callback's
+/// logic is addressed to the id of the frame that created the tunnel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FnFrameId(u64);
+
+static NEXT_FN_FRAME_ID: AtomicU64 = AtomicU64::new(1);
+
+impl FnFrameId {
+    fn next() -> Self {
+        Self(NEXT_FN_FRAME_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+pub struct FnCallContext {
+    pub(crate) inner: Mutex<FnCallContextInner>,
+    /// Whether to merge children's `fn_logic_deps` into this context.
+    /// `true` for "full" mode, `false` for "self" or `None` mode.
+    propagate_children_fn_logic: bool,
+    id: FnFrameId,
+    /// Set once this frame has been joined into its parent or component, i.e.
+    /// its call has returned. A tunnel created in this frame is only valid
+    /// while it is open.
+    closed: AtomicBool,
+}
+
+impl Default for FnCallContext {
+    fn default() -> Self {
+        Self::new(true)
+    }
+}
+
+impl FnCallContext {
+    pub fn new(propagate_children_fn_logic: bool) -> Self {
+        Self {
+            inner: Mutex::new(FnCallContextInner::default()),
+            propagate_children_fn_logic,
+            id: FnFrameId::next(),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn id(&self) -> FnFrameId {
+        self.id
+    }
+
+    /// Whether this frame has been joined into its parent or component.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub fn join_child(&self, child_fn_ctx: &FnCallContext) {
+        // Take the child's inner first to keep lock scope small (and avoid deadlock).
+        let child_inner = child_fn_ctx.update(std::mem::take);
+        child_fn_ctx.close();
+        self.merge_child_inner(child_inner);
+    }
+
+    /// Join a tunneled callback's collector frame.
+    ///
+    /// What the callback offered (the collector's `fn_logic_deps`) is addressed
+    /// to `owner`, the frame that created the tunnel, and rides upward tagged
+    /// until it gets there — through frames that would otherwise drop it. If
+    /// this frame *is* the owner, it is resolved right here: recorded in this
+    /// frame's entry, and offered upward only under this frame's flag.
+    /// Everything else the collector gathered merges as for `join_child`.
+    pub fn join_tunneled_child(&self, child_fn_ctx: &FnCallContext, owner: FnFrameId) {
+        let mut child_inner = child_fn_ctx.update(std::mem::take);
+        child_fn_ctx.close();
+        let offered = std::mem::take(&mut child_inner.fn_logic_deps);
+        child_inner
+            .tunneled_fn_logic_deps
+            .entry(owner)
+            .or_default()
+            .extend(offered);
+        self.merge_child_inner(child_inner);
+    }
+
+    fn merge_child_inner(&self, child_inner: FnCallContextInner) {
+        self.update(|inner| {
+            inner
+                .target_state_paths
+                .extend(child_inner.target_state_paths);
+            inner
+                .target_provider_deps
+                .extend(child_inner.target_provider_deps);
+            inner
+                .dependency_memo_entries
+                .extend(child_inner.dependency_memo_entries);
+            inner.has_child_components |= child_inner.has_child_components;
+            // Context change deps always propagate, and so does what a memo
+            // hit re-offered from a stored entry (see `reoffered_logic_deps`).
+            inner
+                .context_change_deps
+                .extend(child_inner.context_change_deps);
+            inner
+                .reoffered_logic_deps
+                .extend(child_inner.reoffered_logic_deps);
+            inner.data_deps.merge(child_inner.data_deps);
+            // Function logic deps conditionally propagate.
+            if self.propagate_children_fn_logic {
+                inner.fn_logic_deps.extend(child_inner.fn_logic_deps);
+            }
+            // Tunneled deps ride through every frame until they reach the
+            // owner that created the tunnel. The owner's entry always records
+            // them; its flag only decides whether they are offered upward.
+            for (owner, fps) in child_inner.tunneled_fn_logic_deps {
+                if owner == self.id {
+                    if self.propagate_children_fn_logic {
+                        inner.fn_logic_deps.extend(fps);
+                    } else {
+                        inner.entry_only_fn_logic_deps.extend(fps);
+                    }
+                } else {
+                    inner
+                        .tunneled_fn_logic_deps
+                        .entry(owner)
+                        .or_default()
+                        .extend(fps);
+                }
+            }
+            // `entry_only_fn_logic_deps` belongs to the child's own memo entry
+            // and is deliberately not propagated.
+        });
+    }
+
+    /// Merge a snapshot of `child_fn_ctx` without consuming it.
+    ///
+    /// Batched SDK functions execute one shared body for several per-item
+    /// function-call contexts. Each item must inherit the same dependencies,
+    /// so the shared context needs to be joined more than once.
+    pub fn join_child_shared(&self, child_fn_ctx: &FnCallContext) {
+        let child_inner = child_fn_ctx.update(|inner| inner.clone());
+        child_fn_ctx.close();
+        self.merge_child_inner(child_inner);
+    }
+
+    pub fn add_fn_logic_dep(&self, fp: Fingerprint) {
+        self.update(|inner| {
+            inner.fn_logic_deps.insert(fp);
+        });
+    }
+
+    pub fn add_context_change_dep(&self, fp: Fingerprint) {
+        self.update(|inner| {
+            inner.context_change_deps.insert(fp);
+        });
+    }
+
+    /// Record a data dependency into this frame (see [`DataDeps::insert`]).
+    pub fn add_data_dep(&self, record: DataDepRecord) {
+        self.update(|inner| {
+            inner.data_deps.insert(record);
+        });
+    }
+
+    /// Collect initial memo states for the change-detection context fingerprints
+    /// observed so far in this function-call context, by looking them up in
+    /// the given env's eager-initial-states registry.
+    ///
+    /// Parallel to `ComponentProcessorContext::collect_context_initial_states`;
+    /// used on cache miss in the function-level memoization path (where we
+    /// only have an `FnCallContext`, not a `ComponentProcessorContext`).
+    pub fn collect_context_initial_states<Prof: EngineProfile>(
+        &self,
+        env: &Environment<Prof>,
+    ) -> Vec<(Fingerprint, Vec<Prof::FunctionData>)> {
+        self.update(|inner| env.collect_context_initial_states(inner.context_change_deps.iter()))
+    }
+
+    pub fn update<T>(&self, f: impl FnOnce(&mut FnCallContextInner) -> T) -> T {
+        let mut guard = self.inner.lock().unwrap();
+        f(&mut guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{UserStateCache, UserStateEntry};
+    use crate::engine::profile::Persist;
+    use crate::state::db_schema::StateKind;
+    use crate::state::stable_path::{StableKey, StablePath};
+    use crate::state_store::{AppStore, WriteTxn};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    /// Minimal `Persist` value type for exercising the generic `UserStateCache`.
+    /// Serialization is identity (the inner bytes), so flush-plan assertions can
+    /// keep comparing against raw byte strings.
+    #[derive(Clone, PartialEq, Debug)]
+    struct TestData(Vec<u8>);
+
+    impl Persist for TestData {
+        fn to_bytes(&self) -> crate::prelude::Result<bytes::Bytes> {
+            Ok(bytes::Bytes::from(self.0.clone()))
+        }
+
+        fn from_bytes(data: &[u8]) -> crate::prelude::Result<Self> {
+            Ok(TestData(data.to_vec()))
+        }
+    }
+
+    fn sym(s: &str) -> StableKey {
+        StableKey::Symbol(Arc::from(s))
+    }
+
+    fn b(s: &str) -> Vec<u8> {
+        s.as_bytes().to_vec()
+    }
+
+    /// Wrap a string as `TestData` for `use_state` / `update_declared` inputs.
+    fn td(s: &str) -> TestData {
+        TestData(s.as_bytes().to_vec())
+    }
+
+    fn comp_path(name: &str) -> StablePath {
+        StablePath(Arc::from(vec![StableKey::Str(Arc::from(name))]))
+    }
+
+    async fn make_test_store() -> (AppStore, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("mdb");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .read_txn_without_tls()
+                .max_dbs(4)
+                .map_size(1 << 22)
+                .open(&db_path)
+        }
+        .unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        let db = env.create_database(&mut wtxn, Some("test")).unwrap();
+        wtxn.commit().unwrap();
+        let storage = crate::state_store::Storage::from_env(env);
+        (
+            AppStore::new(crate::state_store::Db::new(db, "test"), storage),
+            dir,
+        )
+    }
+
+    fn to_map(pairs: Vec<(StableKey, Vec<u8>)>) -> HashMap<StableKey, Vec<u8>> {
+        pairs.into_iter().collect()
+    }
+
+    /// Read back a component's Regular user states through the production
+    /// prefetch path (`prefetch_fn_processing_states`), so these tests assert
+    /// against the same read code the engine runs.
+    async fn read_regular_states(store: &AppStore, p: &StablePath) -> HashMap<StableKey, Vec<u8>> {
+        to_map(store.prefetch_fn_processing_states(p).await.unwrap().1)
+    }
+
+    // --- use_state -----------------------------------------------------------
+
+    #[test]
+    fn use_state_returns_initial_when_no_loaded_state() {
+        let mut cache = UserStateCache::new();
+        let val = cache.use_state(sym("k"), td("init")).unwrap();
+        assert_eq!(val, td("init"));
+    }
+
+    #[test]
+    fn use_state_returns_loaded_value_ignoring_initial() {
+        let mut cache = UserStateCache::new();
+        cache.populate(vec![(sym("k"), b("stored"))]).unwrap();
+        let val = cache.use_state(sym("k"), td("init")).unwrap();
+        assert_eq!(val, td("stored")); // initial_value is ignored
+    }
+
+    #[test]
+    fn use_state_duplicate_key_errors() {
+        let mut cache = UserStateCache::new();
+        cache.use_state(sym("k"), td("v")).unwrap();
+        assert!(cache.use_state(sym("k"), td("v2")).is_err());
+    }
+
+    #[test]
+    fn use_state_loaded_and_fresh_keys_independent() {
+        let mut cache = UserStateCache::new();
+        cache.populate(vec![(sym("a"), b("stored_a"))]).unwrap();
+        let va = cache.use_state(sym("a"), td("ignored")).unwrap();
+        let vb = cache.use_state(sym("b"), td("init_b")).unwrap();
+        assert_eq!(va, td("stored_a")); // from loaded state
+        assert_eq!(vb, td("init_b")); // initial_value (not in loaded)
+    }
+
+    // --- update_declared -----------------------------------------------------
+
+    #[test]
+    fn update_declared_undeclared_key_errors() {
+        let mut cache = UserStateCache::new();
+        assert!(cache.update_declared(&sym("k"), td("v")).is_err());
+    }
+
+    #[test]
+    fn update_declared_updates_value_in_declared() {
+        let mut cache = UserStateCache::new();
+        cache.use_state(sym("k"), td("init")).unwrap();
+        cache.update_declared(&sym("k"), td("updated")).unwrap();
+        // The updated value is what into_flush_plan will emit.
+        assert!(matches!(
+            &cache.entries[&sym("k")],
+            UserStateEntry::Declared(v) if v == &td("updated")
+        ));
+    }
+
+    // --- into_flush_plan tests ----------------------------
+
+    /// Helper: apply a `UserStateCache` through `into_flush_plan` + `CommitPlan`
+    /// + `AppStore::commit` — the production write path.
+    async fn apply_plan_via_commit(
+        store: &AppStore,
+        path: &StablePath,
+        cache: UserStateCache<TestData>,
+    ) {
+        use crate::state_store::{CommitPlan, TrackingInfoWrite};
+
+        let plan_data = cache.into_flush_plan().unwrap();
+        let plan = CommitPlan {
+            tracking_info: TrackingInfoWrite::Delete,
+            target_owners_to_upsert: Vec::new(),
+            target_owners_to_delete: Vec::new(),
+            fn_memo_clear_all_first: false,
+            fn_memo_writes: Vec::new(),
+            fn_memo_deletes: Vec::new(),
+            user_state_clear_all_first: plan_data.clear_all_first,
+            user_state_writes: plan_data.writes,
+            user_state_deletes: plan_data.deletes,
+            user_state_clear_live: false,
+        };
+        store.commit(path, plan, None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn flush_plan_set_reduction_removes_dropped_keys() {
+        // loaded = {a, b, c}; declared = {a, b} → c deleted via CommitPlan path.
+        let (store, _dir) = make_test_store().await;
+        let p = comp_path("comp");
+
+        let env = store.env();
+        let mut wtxn = WriteTxn::applying(env.write_txn().unwrap());
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("a"), b"a")
+            .await
+            .unwrap();
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("b"), b"b")
+            .await
+            .unwrap();
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("c"), b"c")
+            .await
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        let mut cache = UserStateCache::new();
+        cache
+            .populate(vec![
+                (sym("a"), b("a")),
+                (sym("b"), b("b")),
+                (sym("c"), b("c")),
+            ])
+            .unwrap();
+        cache.use_state(sym("a"), td("ignored")).unwrap();
+        cache.use_state(sym("b"), td("ignored")).unwrap();
+        // "c" not re-declared
+
+        apply_plan_via_commit(&store, &p, cache).await;
+
+        let entries = read_regular_states(&store, &p).await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.contains_key(&sym("a")));
+        assert!(entries.contains_key(&sym("b")));
+        assert!(!entries.contains_key(&sym("c")));
+    }
+
+    #[tokio::test]
+    async fn flush_plan_full_reprocess_wipes_and_writes_declared() {
+        // DB has pre-existing entry; cache never populated (full_reprocess);
+        // declared = {new_k} → old entry wiped, only new_k survives.
+        let (store, _dir) = make_test_store().await;
+        let p = comp_path("comp");
+
+        let env = store.env();
+        let mut wtxn = WriteTxn::applying(env.write_txn().unwrap());
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("old"), b"old")
+            .await
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        let mut cache = UserStateCache::new(); // no populate
+        cache.use_state(sym("new_k"), td("new_val")).unwrap();
+
+        apply_plan_via_commit(&store, &p, cache).await;
+
+        let entries = read_regular_states(&store, &p).await;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries.contains_key(&sym("old")));
+        assert_eq!(entries[&sym("new_k")], b("new_val"));
+    }
+
+    #[tokio::test]
+    async fn flush_plan_set_reduction_adds_new_keys() {
+        // loaded = {a}; declared = {a, b_new} → b inserted, a's stored value kept.
+        let (store, _dir) = make_test_store().await;
+        let p = comp_path("comp");
+
+        let env = store.env();
+        let mut wtxn = WriteTxn::applying(env.write_txn().unwrap());
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("a"), b"a_val")
+            .await
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        let mut cache = UserStateCache::new();
+        cache.populate(vec![(sym("a"), b("a_val"))]).unwrap();
+        cache.use_state(sym("a"), td("should_be_ignored")).unwrap();
+        cache.use_state(sym("b"), td("b_new")).unwrap();
+
+        apply_plan_via_commit(&store, &p, cache).await;
+
+        let entries = read_regular_states(&store, &p).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[&sym("a")], b("a_val"));
+        assert_eq!(entries[&sym("b")], b("b_new"));
+    }
+
+    #[tokio::test]
+    async fn flush_plan_set_reduction_persists_updated_value() {
+        // loaded = {k: "old"}; declare k then update_declared to "new" → k written with "new".
+        let (store, _dir) = make_test_store().await;
+        let p = comp_path("comp");
+
+        let env = store.env();
+        let mut wtxn = WriteTxn::applying(env.write_txn().unwrap());
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("k"), b"old")
+            .await
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        let mut cache = UserStateCache::new();
+        cache.populate(vec![(sym("k"), b("old"))]).unwrap();
+        cache.use_state(sym("k"), td("ignored")).unwrap();
+        cache.update_declared(&sym("k"), td("new")).unwrap();
+
+        apply_plan_via_commit(&store, &p, cache).await;
+
+        let entries = read_regular_states(&store, &p).await;
+        assert_eq!(entries[&sym("k")], b("new"));
+    }
+
+    #[tokio::test]
+    async fn flush_plan_set_reduction_empty_declared_removes_all() {
+        // loaded = {a, b}; no use_state calls → all entries deleted.
+        let (store, _dir) = make_test_store().await;
+        let p = comp_path("comp");
+
+        let env = store.env();
+        let mut wtxn = WriteTxn::applying(env.write_txn().unwrap());
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("a"), b"a_val")
+            .await
+            .unwrap();
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("b"), b"b_val")
+            .await
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        let mut cache = UserStateCache::new();
+        cache
+            .populate(vec![(sym("a"), b("a_val")), (sym("b"), b("b_val"))])
+            .unwrap();
+        // no use_state calls
+
+        apply_plan_via_commit(&store, &p, cache).await;
+
+        assert!(read_regular_states(&store, &p).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn flush_plan_full_reprocess_no_declared_clears_db() {
+        // DB has pre-existing entry; cache never populated; no use_state calls
+        // → clear_all_first wipes everything, DB is empty.
+        let (store, _dir) = make_test_store().await;
+        let p = comp_path("comp");
+
+        let env = store.env();
+        let mut wtxn = WriteTxn::applying(env.write_txn().unwrap());
+        store
+            .write_user_state(&mut wtxn, &p, StateKind::Regular, &sym("old"), b"old_val")
+            .await
+            .unwrap();
+        wtxn.commit().unwrap();
+
+        let cache = UserStateCache::new(); // no populate, no use_state
+
+        apply_plan_via_commit(&store, &p, cache).await;
+
+        assert!(read_regular_states(&store, &p).await.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fn_call_context_tests {
+    use super::{DataDepRecord, DataDeps, FnCallContext};
+    use cocoindex_utils::fingerprint::Fingerprint;
+    use std::collections::HashSet;
+
+    fn fp(name: &str) -> Fingerprint {
+        Fingerprint::from(name).unwrap()
+    }
+
+    fn fn_logic_deps(ctx: &FnCallContext) -> HashSet<Fingerprint> {
+        ctx.update(|inner| inner.fn_logic_deps.clone())
+    }
+
+    fn record(kind: &str, key: &str, state: &str) -> DataDepRecord {
+        DataDepRecord {
+            kind_fp: fp(kind),
+            key_fp: fp(key),
+            state_fp: fp(state),
+            key: bytes::Bytes::from(key.to_owned()),
+            state: bytes::Bytes::from(state.to_owned()),
+        }
+    }
+
+    #[test]
+    fn data_deps_dedupe_equal_observations_and_flag_conflicting_ones() {
+        let mut deps = DataDeps::default();
+        deps.insert(record("file", "a", "s1"));
+        deps.insert(record("file", "a", "s1"));
+        deps.insert(record("file", "b", "s1"));
+        assert_eq!(deps.sorted_records().len(), 2);
+        assert!(deps.conflict().is_none());
+
+        // The same key in another state: a conflict naming that key,
+        // whichever side merges.
+        let mut other = DataDeps::default();
+        other.insert(record("file", "a", "s2"));
+        let mut left = deps.clone();
+        left.merge(other.clone());
+        assert_eq!(left.conflict(), Some((fp("file"), fp("a"))));
+        other.merge(deps.clone());
+        assert_eq!(other.conflict(), Some((fp("file"), fp("a"))));
+
+        // Another kind with the same key is a different record.
+        deps.insert(record("dir", "a", "s2"));
+        assert!(deps.conflict().is_none());
+        assert_eq!(deps.sorted_records().len(), 3);
+    }
+
+    #[test]
+    fn data_deps_ride_through_a_frame_whatever_its_logic_tracking() {
+        let child = FnCallContext::new(true);
+        child.add_data_dep(record("file", "a", "s1"));
+        let parent = FnCallContext::new(false);
+        parent.join_child(&child);
+        assert_eq!(
+            parent.update(|inner| inner.data_deps.sorted_records().len()),
+            1
+        );
+    }
+
+    fn entry_logic_deps(ctx: &FnCallContext) -> HashSet<Fingerprint> {
+        ctx.update(|inner| inner.entry_logic_deps().collect())
+    }
+
+    /// A tunneled wrapper owned by `owner` was called from `caller`; the
+    /// callback offered `offered`.
+    fn tunneled_call(caller: &FnCallContext, owner: &FnCallContext, offered: &[Fingerprint]) {
+        let collector = FnCallContext::new(true);
+        for f in offered {
+            collector.add_fn_logic_dep(*f);
+        }
+        caller.join_tunneled_child(&collector, owner.id());
+    }
+
+    #[test]
+    fn tunneled_deps_pass_self_frames_and_resolve_at_a_full_owner() {
+        let owner = FnCallContext::new(true);
+        let h = FnCallContext::new(false);
+        let t = FnCallContext::new(false);
+        t.add_fn_logic_dep(fp("T"));
+        tunneled_call(&t, &owner, &[fp("cb")]);
+        // T's entry records the callback though T is "self"; T offers only itself.
+        assert_eq!(entry_logic_deps(&t), [fp("T"), fp("cb")].into());
+        assert_eq!(fn_logic_deps(&t), [fp("T")].into());
+        h.join_child(&t);
+        // H ("self") drops T's own logic but passes the tagged set through.
+        assert_eq!(entry_logic_deps(&h), [fp("cb")].into());
+        assert!(fn_logic_deps(&h).is_empty());
+        owner.join_child(&h);
+        // At the owner the set resolves into ordinary deps under its flag.
+        assert_eq!(fn_logic_deps(&owner), [fp("cb")].into());
+        assert!(owner.update(|inner| inner.tunneled_fn_logic_deps.is_empty()));
+    }
+
+    #[test]
+    fn self_owner_records_in_its_entry_and_offers_nothing_upward() {
+        let above = FnCallContext::new(true);
+        let owner = FnCallContext::new(false);
+        let t = FnCallContext::new(false);
+        tunneled_call(&t, &owner, &[fp("cb")]);
+        owner.join_child(&t);
+        assert_eq!(entry_logic_deps(&owner), [fp("cb")].into());
+        assert!(fn_logic_deps(&owner).is_empty());
+        above.join_child(&owner);
+        assert!(entry_logic_deps(&above).is_empty());
+    }
+
+    #[test]
+    fn self_ancestor_above_a_full_owner_sees_nothing() {
+        let s = FnCallContext::new(false);
+        let owner = FnCallContext::new(true);
+        let t = FnCallContext::new(false);
+        tunneled_call(&t, &owner, &[fp("cb")]);
+        owner.join_child(&t);
+        assert_eq!(fn_logic_deps(&owner), [fp("cb")].into());
+        s.join_child(&owner);
+        assert!(entry_logic_deps(&s).is_empty());
+    }
+
+    #[test]
+    fn tunneled_call_directly_in_the_owner_frame_resolves_at_once() {
+        let full_owner = FnCallContext::new(true);
+        tunneled_call(&full_owner, &full_owner, &[fp("cb")]);
+        assert_eq!(fn_logic_deps(&full_owner), [fp("cb")].into());
+
+        let parent = FnCallContext::new(true);
+        let self_owner = FnCallContext::new(false);
+        tunneled_call(&self_owner, &self_owner, &[fp("cb")]);
+        assert_eq!(entry_logic_deps(&self_owner), [fp("cb")].into());
+        parent.join_child(&self_owner);
+        assert!(entry_logic_deps(&parent).is_empty());
+    }
+
+    #[test]
+    fn distinct_owners_resolve_independently() {
+        let o = FnCallContext::new(true);
+        let h = FnCallContext::new(false);
+        let t = FnCallContext::new(false);
+        tunneled_call(&t, &o, &[fp("cb1")]);
+        tunneled_call(&t, &h, &[fp("cb2")]);
+        assert_eq!(entry_logic_deps(&t), [fp("cb1"), fp("cb2")].into());
+        h.join_child(&t);
+        // cb2 resolves at H: recorded in H's entry, not offered (H is "self");
+        // cb1 rides on.
+        assert_eq!(entry_logic_deps(&h), [fp("cb1"), fp("cb2")].into());
+        o.join_child(&h);
+        assert_eq!(fn_logic_deps(&o), [fp("cb1")].into());
+    }
+
+    #[test]
+    fn joins_close_the_child_frame() {
+        let parent = FnCallContext::new(true);
+        let a = FnCallContext::new(true);
+        let b = FnCallContext::new(true);
+        let c = FnCallContext::new(true);
+        assert!(!a.is_closed());
+        parent.join_child(&a);
+        parent.join_child_shared(&b);
+        parent.join_tunneled_child(&c, parent.id());
+        assert!([&a, &b, &c].iter().all(|ctx| ctx.is_closed()));
+        assert!(!parent.is_closed());
+    }
+}

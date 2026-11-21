@@ -1,0 +1,246 @@
+use crate::engine::context::{
+    ComponentProcessorContext, DataDepRecord, FnCallContext, FnCallMemo, FnCallMemoEntry,
+    MemoStatesPayload, decode_stored_entry,
+};
+use crate::engine::execution::target_provider_deps_still_valid;
+use crate::engine::profile::EngineProfile;
+use crate::prelude::*;
+
+use cocoindex_utils::fingerprint::Fingerprint;
+
+/// Builds a `FnCallMemo` from a completed function call's context, return value, and states.
+fn build_fn_call_memo<Prof: EngineProfile>(
+    fn_ctx: &FnCallContext,
+    ret: Prof::FunctionData,
+    memo_states: MemoStatesPayload<Prof>,
+) -> Option<FnCallMemo<Prof>> {
+    fn_ctx.update(|inner| {
+        Some(FnCallMemo {
+            ret,
+            target_state_paths: inner.target_state_paths.clone(),
+            target_provider_deps: inner.target_provider_deps.clone(),
+            dependency_memo_entries: inner.dependency_memo_entries.clone(),
+            logic_deps: inner.entry_logic_deps().collect(),
+            memo_states: memo_states.positional,
+            context_memo_states: memo_states.by_context_fp,
+            data_deps: inner.data_deps.sorted_records(),
+            persisted: false,
+            reused: false,
+        })
+    })
+}
+
+/// Guard for a function-call memo entry. Always holds a write lock.
+///
+/// Returned by [`reserve_memoization`]. Use [`cached()`](Self::cached) to check for a
+/// cache hit, then either return the cached value directly or call
+/// [`resolve()`](Self::resolve) after (re-)execution. Dropping the guard without calling
+/// `resolve()` releases the write lock and leaves the entry unchanged.
+///
+/// Concurrent callers for the same fingerprint serialize through the write lock. This
+/// prevents duplicate re-execution when memo states are stale: only one caller validates
+/// and potentially re-executes per key; subsequent callers see the updated result.
+pub struct FnCallMemoGuard<Prof: EngineProfile> {
+    guard: tokio::sync::OwnedRwLockWriteGuard<FnCallMemoEntry<Prof>>,
+}
+
+/// Cached memo view returned on a cache hit.
+pub struct CachedFnCallMemo<'a, Prof: EngineProfile> {
+    pub ret: &'a Prof::FunctionData,
+    pub memo_states: &'a [Prof::FunctionData],
+    pub context_memo_states: &'a [(Fingerprint, Vec<Prof::FunctionData>)],
+    pub data_deps: &'a [DataDepRecord],
+}
+
+impl<Prof: EngineProfile> FnCallMemoGuard<Prof> {
+    /// Returns the cached return value and memo states if this is a cache hit.
+    /// Returns `None` on cache miss or if memoization is disabled for this entry.
+    pub fn cached(&self) -> Option<CachedFnCallMemo<'_, Prof>> {
+        match &*self.guard {
+            FnCallMemoEntry::Ready(Some(memo)) => Some(CachedFnCallMemo {
+                ret: &memo.ret,
+                memo_states: &memo.memo_states,
+                context_memo_states: &memo.context_memo_states,
+                data_deps: &memo.data_deps,
+            }),
+            _ => None,
+        }
+    }
+
+    /// On a cache hit, merge the stored entry's target-provider deps into the
+    /// calling context.
+    ///
+    /// A hit skips re-declaring the entry's target states, so the caller's own
+    /// memo entry (a component or an enclosing memoized function) would
+    /// otherwise be re-stored *without* these deps — and a later provider
+    /// generation bump would no longer invalidate it. Each entry stores the
+    /// full dep set of its subtree (accumulated via `join_child` at record
+    /// time), so this single merge keeps propagation transitive across
+    /// arbitrarily nested hits. Call it exactly when the cached value is used;
+    /// the deps were validated against live generations at reserve time, so
+    /// the merged values always match what a fresh declaration would record.
+    pub fn join_cached_target_provider_deps(&self, parent_fn_ctx: &FnCallContext) {
+        if let FnCallMemoEntry::Ready(Some(memo)) = &*self.guard
+            && !memo.target_provider_deps.is_empty()
+        {
+            parent_fn_ctx.update(|inner| {
+                inner.target_provider_deps.extend(
+                    memo.target_provider_deps
+                        .iter()
+                        .map(|(path, generation)| (path.clone(), generation.clone())),
+                );
+            });
+        }
+    }
+
+    /// On a cache hit, re-offer the stored entry's logic deps through the
+    /// callee's own frame.
+    ///
+    /// A hit skips the body, so when `fn_ctx` is joined into the caller it
+    /// holds only the callee's own fingerprint; everything the entry recorded
+    /// beneath that — callees under `"full"`, per-call logic deps, tunneled
+    /// callbacks in transit to an owner above, context keys — would be
+    /// missing from a caller re-stored after the hit, and a later change to
+    /// one of them would no longer invalidate that caller (the callee's own
+    /// entry would miss, but a caller that hits never reaches it).
+    ///
+    /// The stored set is flat, so the kinds a miss treats differently cannot
+    /// be told apart: the callee's own and `"full"`-propagated logic follows
+    /// the caller's `logic_tracking`, while tunneled sets ride to their owner
+    /// and context-change deps ride everywhere regardless of it. Re-offering
+    /// the whole set through a mode-governed channel would drop the tunneled
+    /// and context parts under a `"self"` caller — a stale entry. It goes
+    /// through [`FnCallContextInner::reoffered_logic_deps`] instead, which
+    /// rides to the enclosing component's entry through every frame: a
+    /// `"self"` caller re-stored after a hit then records its callee's own
+    /// logic too, which a miss would have dropped — more invalidation, never
+    /// stale. Recording the kinds separately in the entry would restore the
+    /// exact miss behaviour. Call it exactly when the cached value is used,
+    /// next to
+    /// [`join_cached_target_provider_deps`](Self::join_cached_target_provider_deps).
+    pub fn join_cached_logic_deps(&self, fn_ctx: &FnCallContext) {
+        if let FnCallMemoEntry::Ready(Some(memo)) = &*self.guard
+            && !memo.logic_deps.is_empty()
+        {
+            fn_ctx.update(|inner| {
+                inner
+                    .reoffered_logic_deps
+                    .extend(memo.logic_deps.iter().copied());
+            });
+        }
+    }
+
+    /// On a cache hit, re-offer the stored entry's data dependencies through
+    /// the callee's own frame, so a caller re-stored after the hit records
+    /// them too. Call next to [`join_cached_logic_deps`](Self::join_cached_logic_deps),
+    /// after any refresh of the states, so the re-offered records are the
+    /// refreshed ones.
+    pub fn join_cached_data_deps(&self, fn_ctx: &FnCallContext) {
+        if let FnCallMemoEntry::Ready(Some(memo)) = &*self.guard
+            && !memo.data_deps.is_empty()
+        {
+            fn_ctx.update(|inner| {
+                for record in memo.data_deps.iter().cloned() {
+                    inner.data_deps.insert(record);
+                }
+            });
+        }
+    }
+
+    /// Update memo states on a cache hit without re-execution.
+    ///
+    /// Used when the state function indicates `can_reuse=true` but the state value itself
+    /// has changed (e.g. mtime changed but content fingerprint is the same). Clears
+    /// `persisted` so the entry gets written with updated states at finalization
+    /// time, and leaves `reused` set: the body did not run, so the entry must keep
+    /// protecting its target states and the entries it depends on.
+    pub fn update_memo_states(&mut self, memo_states: MemoStatesPayload<Prof>) {
+        if let FnCallMemoEntry::Ready(Some(ref mut memo)) = *self.guard {
+            memo.memo_states = memo_states.positional;
+            memo.context_memo_states = memo_states.by_context_fp;
+            memo.data_deps = memo_states.data_deps;
+            memo.persisted = false;
+        }
+    }
+
+    /// Store the function's return value and memo states after execution.
+    ///
+    /// Works for both cache miss (initial execution) and cache hit with stale memo states
+    /// (re-execution after validation). Consumes `self`, transitioning the entry to `Ready`
+    /// and releasing the write lock.
+    pub fn resolve(
+        mut self,
+        fn_ctx: &FnCallContext,
+        ret: impl FnOnce() -> Prof::FunctionData,
+        memo_states: MemoStatesPayload<Prof>,
+    ) -> Result<bool> {
+        let (has_child_components, data_dep_conflict) =
+            fn_ctx.update(|inner| (inner.has_child_components, inner.data_deps.conflict()));
+        if let Some((kind_fp, key_fp)) = data_dep_conflict {
+            // The call observed one key in two states: no single stored state
+            // can validate its output. Store nothing (a previous row is deleted
+            // at flush), so the call runs again next time.
+            debug!(
+                "memoized function call observed data dependency (kind {kind_fp:?}, key {key_fp:?}) in two states; storing no entry"
+            );
+            *self.guard = FnCallMemoEntry::Ready(None);
+            return Ok(false);
+        }
+        if has_child_components {
+            *self.guard = FnCallMemoEntry::Ready(None);
+            client_bail!(
+                "A memoized function (`memo=True` in Python, `#[function(memo)]` in Rust) \
+                 mounted child components. Either mount the function as a component, \
+                 or turn off its memoization."
+            );
+        }
+        let memo_ret = build_fn_call_memo(fn_ctx, ret(), memo_states);
+        let resolved = memo_ret.is_some();
+        *self.guard = FnCallMemoEntry::Ready(memo_ret);
+        Ok(resolved)
+    }
+}
+
+/// Reserve a memoization slot for a function call, returning a guard.
+///
+/// If a cached result exists (from a previous run or earlier in this run), the guard's
+/// [`cached()`](FnCallMemoGuard::cached) method will return it. Otherwise, the caller
+/// should execute the function and call [`resolve()`](FnCallMemoGuard::resolve).
+pub async fn reserve_memoization<Prof: EngineProfile>(
+    comp_exec_ctx: &ComponentProcessorContext<Prof>,
+    memo_fp: Fingerprint,
+) -> Result<FnCallMemoGuard<Prof>> {
+    // Clone the Arc so we don't hold building_state's mutex across `.await`.
+    // The cache was eagerly prefetched at the start of build mode, so any
+    // entry from the database is already in memory as `Stored(bytes)`.
+    let memo_entry = comp_exec_ctx.update_building_state(|building_state| {
+        Ok(building_state.fn_memos.entry_or_pending(memo_fp))
+    })?;
+
+    let mut guard = memo_entry.write_owned().await;
+
+    // Lazy-decode prefetched bytes on first access. Decoding may fall through
+    // to `Ready(None)` if the entry's logic deps no longer resolve or if it's
+    // a legacy entry with `child_components` — both cases force re-execution.
+    if matches!(&*guard, FnCallMemoEntry::Stored(_)) {
+        decode_stored_entry::<Prof>(&mut guard, comp_exec_ctx.app_ctx().env())?;
+    }
+
+    // A hit would skip re-declaring the target states this entry covers, so it
+    // is only reusable while the providers it declared against are still at the
+    // generations it recorded. Checked here rather than in `decode_stored_entry`
+    // because the finalize dep walk decodes entries to collect their contained
+    // target state paths — invalidating there would drop those paths from the
+    // contained set and let the delete pass remove live target states.
+    if let FnCallMemoEntry::Ready(Some(memo)) = &*guard
+        && !memo.target_provider_deps.is_empty()
+        && !target_provider_deps_still_valid(
+            memo.target_provider_deps.iter(),
+            &comp_exec_ctx.target_states_providers()?,
+        )
+    {
+        *guard = FnCallMemoEntry::Ready(None);
+    }
+
+    Ok(FnCallMemoGuard { guard })
+}

@@ -1,0 +1,357 @@
+---
+// The examples catalog at /docs/examples: a filter rail (category, source,
+// target, model, level) beside category sections of cards. Every card and
+// every filter value comes from src/data/examples.ts, so adding an example
+// there is the whole job. Filters combine (AND), hold in the URL query, and
+// recount live; the phone and tablet toolbar mirrors the rail with chips and
+// native selects.
+import '../../styles/globals.css';
+import '../../styles/examples.css';
+import Topbar from '../../components/Topbar.astro';
+import MobileSheet from '../../components/MobileSheet.astro';
+import Analytics from '../../components/Analytics.astro';
+import ScarfPixel from '../../components/ScarfPixel.astro';
+import Foot from '../../components/Foot.astro';
+import ExampleCard from '../../components/examples/ExampleCard.astro';
+import { GITHUB_REPO, DISCORD_URL, SITE_URL, SCARF_PIXEL_ID, OG_IMAGE_EXAMPLES, OG_IMAGE_WIDTH, OG_IMAGE_HEIGHT, OG_IMAGE_EXAMPLES_ALT, THEME_COLOR, titleText } from '../../consts';
+import { examples, byCategory, CATEGORY_META, FACETS, facetValues, type Category } from '../../data/examples';
+import type { SidebarItem } from '../../data/docs-sidebar';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '') || '';
+const exampleHref = (slug: string) => `${base}/examples/${slug}/`;
+
+// Category order: the two search shapes first, then LLM output, then plumbing.
+const CAT_ORDER: Category[] = ['search', 'image', 'llm', 'agents', 'ingest'];
+const catCount = (c: Category) => examples.filter((e) => e.category === c).length;
+const activeCats = CAT_ORDER.filter((c) => catCount(c) > 0);
+const facets = FACETS.map((f) => ({ ...f, values: facetValues(f.kind) }));
+// Long facet groups show their most common values first; the rest fold.
+const RAIL_TOP = 6;
+
+// Phone drawer: the same tree the detail pages show in their rail.
+const examplesSidebar: SidebarItem[] = activeCats.map((c) => ({
+  type: 'category',
+  label: CATEGORY_META[c].label,
+  items: byCategory(c).map((it) => ({ type: 'doc', slug: `examples/${it.slug}`, label: titleText(it.title) })),
+}));
+
+const total = examples.length;
+const fullTitle = 'Examples · CocoIndex Docs';
+const description = 'Working CocoIndex pipelines you can clone and run: semantic search, multimodal search, structured extraction, knowledge graphs, and ingest flows, filtered by source, target, and model.';
+const canonical = new URL(`${base}/examples/`, SITE_URL).toString();
+const ogImage = OG_IMAGE_EXAMPLES;
+
+const collectionLd = {
+  '@context': 'https://schema.org',
+  '@type': 'CollectionPage',
+  name: 'CocoIndex Examples',
+  description,
+  url: canonical,
+  inLanguage: 'en',
+  isPartOf: { '@type': 'WebSite', name: 'CocoIndex Docs', url: new URL(`${base}/`, SITE_URL).toString() },
+  mainEntity: {
+    '@type': 'ItemList',
+    numberOfItems: total,
+    itemListElement: examples.map((e, i) => ({
+      '@type': 'ListItem',
+      position: i + 1,
+      name: titleText(e.title),
+      description: e.description,
+      url: new URL(`${base}/examples/${e.slug}/`, SITE_URL).toString(),
+    })),
+  },
+};
+const breadcrumbLd = {
+  '@context': 'https://schema.org',
+  '@type': 'BreadcrumbList',
+  itemListElement: [
+    { '@type': 'ListItem', position: 1, name: 'Docs', item: new URL(`${base}/`, SITE_URL).toString() },
+    { '@type': 'ListItem', position: 2, name: 'Examples', item: canonical },
+  ],
+};
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content={THEME_COLOR} />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="CocoIndex Docs" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content={OG_IMAGE_WIDTH} />
+    <meta property="og:image:height" content={OG_IMAGE_HEIGHT} />
+    <meta property="og:image:alt" content={OG_IMAGE_EXAMPLES_ALT} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={fullTitle} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <script type="application/ld+json" set:html={JSON.stringify(collectionLd)} />
+    <script type="application/ld+json" set:html={JSON.stringify(breadcrumbLd)} />
+
+    <link rel="icon" href={`${base}/img/favicon.ico`} />
+  </head>
+  <body class="ex-listing">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <Topbar mobileSheetId="mobileSheet" />
+    <MobileSheet sidebarItems={examplesSidebar} />
+
+    <div class="ex-wrap">
+      <header class="ex-hero">
+        <h1 class="hero-h">Examples</h1>
+        <p class="hero-sub">
+          Working pipelines you can clone and run.{' '}<span class="hero-more">Each one reads a source, transforms it in a Python flow, and keeps a target in sync. Start from the closest one and change the parts that differ.</span>
+        </p>
+      </header>
+
+      <div class="ex-shell">
+        <aside class="ex-rail" aria-label="Filter examples">
+          <div class="ex-rail-group">
+            <h2>Category</h2>
+            <div role="group" aria-label="Category">
+              <button type="button" class="ex-f" data-facet="cat" data-value="" aria-pressed="true">All <span class="n">{total}</span></button>
+              {activeCats.map((c) => (
+                <button type="button" class="ex-f" data-facet="cat" data-value={c} aria-pressed="false">
+                  {CATEGORY_META[c].label} <span class="n">{catCount(c)}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {facets.map((f) => (
+            <div class="ex-rail-group" data-group>
+              <h2>{f.label}</h2>
+              <div role="group" aria-label={f.label}>
+                {f.values.map((v, i) => (
+                  <button type="button" class={`ex-f${i >= RAIL_TOP ? ' is-more' : ''}`} data-facet={f.kind} data-value={v.label} aria-pressed="false">
+                    {v.label} <span class="n">{v.count}</span>
+                  </button>
+                ))}
+              </div>
+              {f.values.length > RAIL_TOP && (
+                <button type="button" class="ex-more" data-more aria-expanded="false">Show all {f.values.length}</button>
+              )}
+            </div>
+          ))}
+        </aside>
+
+        <div class="ex-toolbar">
+          <div class="ex-chips" role="group" aria-label="Category">
+            <button type="button" class="t-filter" data-facet="cat" data-value="" aria-pressed="true">All <span class="cnt">{total}</span></button>
+            {activeCats.map((c) => (
+              <button type="button" class="t-filter" data-facet="cat" data-value={c} aria-pressed="false">
+                {CATEGORY_META[c].label} <span class="cnt">{catCount(c)}</span>
+              </button>
+            ))}
+          </div>
+          <div class="ex-selects">
+            {facets.map((f) => (
+              <label class="ex-select">
+                <span>{f.label}</span>
+                <select data-facet={f.kind} data-facet-label={f.label}>
+                  <option value="">{f.any}</option>
+                  {f.values.map((v) => <option value={v.label} data-label={v.label}>{v.label} ({v.count})</option>)}
+                </select>
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <main class="ex-main" id="main-content" tabindex="-1">
+          <div class="ex-results" tabindex="-1">
+            <p aria-live="polite"><b data-count>{total}</b> <span data-count-noun>examples</span></p>
+            <button type="button" class="ex-clear" data-clear hidden>Clear filters</button>
+          </div>
+
+          {activeCats.map((cat) => (
+            <section class="ex-sec" id={`cat-${cat}`} data-cat={cat}>
+              <div class="ex-sec-head">
+                <h2>{CATEGORY_META[cat].label}<span class="n" data-sec-count>{catCount(cat)}</span></h2>
+                <p>{CATEGORY_META[cat].lead}</p>
+              </div>
+              <div class="ex-grid">
+                {byCategory(cat).map((ex) => <ExampleCard ex={ex} href={exampleHref(ex.slug)} />)}
+              </div>
+            </section>
+          ))}
+
+          <div class="ex-empty" data-empty hidden>
+            <p>No example matches every filter. Remove one, or request the pipeline you need below.</p>
+            <div class="btns" data-empty-actions></div>
+          </div>
+
+          <section class="ex-end" aria-labelledby="ex-end-h">
+            <div>
+              <h2 id="ex-end-h">Can't find the shape you need?</h2>
+              <p>Clone the closest example, swap the source or the target, and keep the rest. Or open an issue and describe the pipeline.</p>
+            </div>
+            <div class="btns">
+              <a class="btn btn-primary" href={`${base}/getting_started/quickstart/`}>Read the quickstart</a>
+              <a class="btn btn-outline-muted" href={`${GITHUB_REPO}/issues/new`}>Request an example</a>
+              <a class="btn btn-outline-muted" href={DISCORD_URL}>Ask on Discord</a>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <script is:inline>
+      // Filters: one state object {cat, src, tgt, llm, lvl}; every control
+      // (rail buttons, toolbar chips, selects) reads and writes it, so the
+      // rail and the toolbar never disagree. Cards carry data-* facet lists;
+      // a card shows when it matches every set facet. Counts recompute per
+      // control against the other facets, so a row says how many results
+      // picking it would leave. State lives in the query string.
+      (function () {
+        var KEYS = ['cat', 'src', 'tgt', 'llm', 'lvl'];
+        var cards = Array.prototype.slice.call(document.querySelectorAll('.ex-card'));
+        var sections = Array.prototype.slice.call(document.querySelectorAll('section.ex-sec[data-cat]'));
+        var buttons = Array.prototype.slice.call(document.querySelectorAll('button[data-facet]'));
+        var selects = Array.prototype.slice.call(document.querySelectorAll('select[data-facet]'));
+        var clears = Array.prototype.slice.call(document.querySelectorAll('[data-clear]'));
+        var countEl = document.querySelector('[data-count]');
+        var nounEl = document.querySelector('[data-count-noun]');
+        var empty = document.querySelector('[data-empty]');
+        var emptyActions = document.querySelector('[data-empty-actions]');
+        var NAMES = { cat: 'Category', src: 'Source', tgt: 'Target', llm: 'Model', lvl: 'Level' };
+        var CAT_NAMES = {};
+        buttons.forEach(function (b) { if (b.getAttribute('data-facet') === 'cat' && b.getAttribute('data-value')) CAT_NAMES[b.getAttribute('data-value')] = b.firstChild.textContent.trim(); });
+        var state = {};
+
+        function values(card, key) {
+          var raw = card.getAttribute('data-' + key) || '';
+          return raw ? raw.split('|') : [];
+        }
+        function matches(card, st) {
+          for (var i = 0; i < KEYS.length; i++) {
+            var k = KEYS[i];
+            if (!st[k]) continue;
+            if (values(card, k).indexOf(st[k]) === -1) return false;
+          }
+          return true;
+        }
+        function readUrl() {
+          var q = new URLSearchParams(location.search);
+          state = {};
+          KEYS.forEach(function (k) { var v = q.get(k); if (v) state[k] = v; });
+        }
+        function writeUrl() {
+          var q = new URLSearchParams();
+          KEYS.forEach(function (k) { if (state[k]) q.set(k, state[k]); });
+          var s = q.toString();
+          history.pushState(null, '', location.pathname + (s ? '?' + s : ''));
+        }
+        function countWith(over) {
+          var probe = {};
+          KEYS.forEach(function (k) { probe[k] = state[k]; });
+          Object.keys(over).forEach(function (k) { probe[k] = over[k]; });
+          return cards.filter(function (c) { return matches(c, probe); }).length;
+        }
+        function render() {
+          var shown = 0;
+          cards.forEach(function (c) {
+            var on = matches(c, state);
+            c.hidden = !on;
+            if (on) shown++;
+          });
+          sections.forEach(function (s) {
+            var n = s.querySelectorAll('.ex-card:not([hidden])').length;
+            s.hidden = n === 0;
+            var sc = s.querySelector('[data-sec-count]');
+            if (sc) sc.textContent = String(n);
+          });
+          var active = KEYS.some(function (k) { return !!state[k]; });
+          if (countEl) countEl.textContent = String(shown);
+          if (nounEl) nounEl.textContent = (shown === 1 ? 'example' : 'examples') + (active ? ' match' : '');
+          if (empty) empty.hidden = shown !== 0;
+          clears.forEach(function (b) { b.hidden = !active || shown === 0; });
+
+          buttons.forEach(function (b) {
+            var k = b.getAttribute('data-facet'), v = b.getAttribute('data-value');
+            var on = (state[k] || '') === v;
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+            var probe = {};
+            KEYS.forEach(function (kk) { probe[kk] = state[kk]; });
+            probe[k] = v || undefined;
+            var n = cards.filter(function (c) { return matches(c, probe); }).length;
+            var nEl = b.querySelector('.n, .cnt');
+            if (nEl) nEl.textContent = String(n);
+            b.classList.toggle('is-zero', n === 0 && !on);
+            b.classList.toggle('is-shown', on);
+          });
+          selects.forEach(function (s) {
+            var k = s.getAttribute('data-facet');
+            Array.prototype.forEach.call(s.options, function (o) {
+              if (!o.value) return;
+              var label = o.getAttribute('data-label');
+              var chosen = state[k] === o.value;
+              o.textContent = label + (chosen ? '' : ' (' + countWith(Object.fromEntries([[k, o.value]])) + ')');
+            });
+            s.value = state[k] || '';
+            s.parentNode.classList.toggle('is-set', !!state[k]);
+          });
+          if (emptyActions) {
+            emptyActions.textContent = '';
+            if (shown === 0) {
+              KEYS.forEach(function (k) {
+                if (!state[k]) return;
+                var n = countWith(Object.fromEntries([[k, undefined]]));
+                var b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'btn btn-outline-muted';
+                b.textContent = 'Remove ' + NAMES[k] + ': ' + (k === 'cat' ? (CAT_NAMES[state[k]] || state[k]) : state[k]) + ' (' + n + ')';
+                b.addEventListener('click', function () { set(k, ''); if (results) results.focus(); });
+                emptyActions.appendChild(b);
+              });
+            }
+          }
+        }
+        var results = document.querySelector('.ex-results');
+        function set(k, v) {
+          if (v) state[k] = v; else delete state[k];
+          writeUrl();
+          render();
+          // Filtering shortens the page; bring the results back into view.
+          if (results && results.getBoundingClientRect().top < 0) results.scrollIntoView({ block: 'start' });
+        }
+        Array.prototype.forEach.call(document.querySelectorAll('[data-more]'), function (m) {
+          m.addEventListener('click', function () {
+            var g = m.closest('[data-group]');
+            var open = !g.classList.contains('is-open');
+            g.classList.toggle('is-open', open);
+            m.setAttribute('aria-expanded', open ? 'true' : 'false');
+            m.textContent = open ? 'Show fewer' : 'Show all ' + g.querySelectorAll('.ex-f').length;
+          });
+        });
+
+        buttons.forEach(function (b) {
+          b.addEventListener('click', function () {
+            var k = b.getAttribute('data-facet'), v = b.getAttribute('data-value');
+            set(k, (state[k] || '') === v ? '' : v);
+          });
+        });
+        selects.forEach(function (s) {
+          s.addEventListener('change', function () { set(s.getAttribute('data-facet'), s.value); });
+        });
+        clears.forEach(function (b) {
+          b.addEventListener('click', function () { state = {}; writeUrl(); render(); if (results) results.focus(); });
+        });
+        window.addEventListener('popstate', function () { readUrl(); render(); });
+        readUrl();
+        render();
+      })();
+    </script>
+
+    <Foot />
+    <Analytics />
+    <ScarfPixel pxid={SCARF_PIXEL_ID} />
+  </body>
+</html>

@@ -1,0 +1,298 @@
+---
+// Docs home. Read mode: it says what the engine does, proves it with one
+// framed lineage figure, and routes the reader with ruled lists of real
+// pages drawn from the sidebar. Styles: src/styles/site.css §9.
+import '../styles/globals.css';
+import Topbar from '../components/Topbar.astro';
+import Sidebar from '../components/Sidebar.astro';
+import MobileSheet from '../components/MobileSheet.astro';
+import Analytics from '../components/Analytics.astro';
+import ScarfPixel from '../components/ScarfPixel.astro';
+import Foot from '../components/Foot.astro';
+import {
+  SITE_URL, SITE_MAIN, SITE_EXAMPLES, GITHUB_REPO, DISCORD_URL,
+  SCARF_PIXEL_ID, THEME_COLOR,
+} from '../consts';
+import { sidebar } from '../data/docs-sidebar';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '') || '';
+const doc = (slug: string) => `${base}/${slug}/`;
+const CODE = `${SITE_MAIN}/cocoindex-code`;
+
+const fullTitle = 'CocoIndex documentation';
+const description =
+  'CocoIndex is an open-source framework for data pipelines that feed AI. Declare the target as a function of the source in Python; the Rust engine keeps it in sync and reprocesses only what changed.';
+const canonical = new URL(`${base}/`, SITE_URL).toString();
+
+// Start here: labels and slugs match the sidebar exactly.
+const start = [
+  { slug: 'getting_started/quickstart', label: 'Quickstart', meta: 'Tutorial',
+    body: 'Build one pipeline end to end: convert PDFs to Markdown, change a file, and watch only that file reprocess.' },
+  { slug: 'getting_started/installation', label: 'Installation', meta: 'Setup',
+    body: 'Install the package and the Rust engine. Python 3.11 or later, with pip, uv or Poetry.' },
+  { slug: 'programming_guide/core_concepts', label: 'Core concepts', meta: 'Mental model',
+    body: 'Apps, processing components, target states, and how an incremental update decides what to re-run.' },
+  { slug: 'getting_started/ai_coding_agents', label: 'Use with AI coding agents', meta: 'Skill',
+    body: 'Install the CocoIndex skill so Claude Code or Cursor writes correct v1 pipelines.' },
+] as const;
+
+// What you can build: each row links to a runnable example or the product page.
+const build = [
+  { href: doc('examples/index-codebase'), title: 'Semantic and vector search', meta: 'Retrieval',
+    body: 'Chunk, embed and index documents or code into pgvector, Qdrant, LanceDB or Turbopuffer.' },
+  { href: doc('examples/meeting-notes-to-knowledge-graph'), title: 'Knowledge graphs', meta: 'Entities and relations',
+    body: 'Extract entities and relationships into Neo4j, FalkorDB or SurrealDB as structured context for agents.' },
+  { href: CODE, title: 'Live code index', meta: 'CocoIndex Code',
+    body: 'AST-aware chunks and call graphs kept current on every commit, served to agents over MCP.' },
+  { href: doc('examples/patient-intake-dspy'), title: 'Structured extraction', meta: 'Ingest and transform',
+    body: 'Turn PDFs, transcripts and inboxes into typed rows with LLM extraction and entity resolution.' },
+] as const;
+
+// Building blocks: connectors and operations straight from the sidebar.
+const sources = [
+  { slug: 'connectors/localfs', label: 'Local files' },
+  { slug: 'connectors/postgres', label: 'Postgres' },
+  { slug: 'connectors/google_drive', label: 'Google Drive' },
+  { slug: 'connectors/amazon_s3', label: 'Amazon S3' },
+  { slug: 'connectors/azure_blob', label: 'Azure Blob' },
+  { slug: 'connectors/oci_object_storage', label: 'OCI Object Storage' },
+  { slug: 'connectors/discord', label: 'Discord' },
+  { slug: 'connectors/kafka', label: 'Kafka' },
+  { slug: 'connectors/iggy', label: 'Iggy' },
+];
+const operations = [
+  { slug: 'ops/text', label: 'Split and chunk' },
+  { slug: 'ops/sentence_transformers', label: 'Embed' },
+  { slug: 'ops/litellm', label: 'LiteLLM' },
+  { slug: 'ops/entity_resolution', label: 'Entity resolution' },
+  { slug: 'programming_guide/function', label: 'Custom @coco.fn' },
+];
+const targets = [
+  { slug: 'connectors/postgres', label: 'pgvector' },
+  { slug: 'connectors/qdrant', label: 'Qdrant' },
+  { slug: 'connectors/lancedb', label: 'LanceDB' },
+  { slug: 'connectors/turbopuffer', label: 'Turbopuffer' },
+  { slug: 'connectors/neo4j', label: 'Neo4j' },
+  { slug: 'connectors/falkordb', label: 'FalkorDB' },
+  { slug: 'connectors/surrealdb', label: 'SurrealDB' },
+  { slug: 'connectors/doris', label: 'Apache Doris' },
+  { slug: 'connectors/bigquery', label: 'BigQuery' },
+  { slug: 'connectors/snowflake', label: 'Snowflake' },
+];
+
+const community = [
+  { href: GITHUB_REPO, title: 'GitHub', meta: 'Apache-2.0', body: 'Read the source, star the repo, open an issue.' },
+  { href: DISCORD_URL, title: 'Discord', meta: 'Community', body: 'Release notes, showcases and help from the maintainers.' },
+  { href: SITE_EXAMPLES, title: 'Examples', meta: 'Runnable', body: 'Pipelines you can clone, run and adapt to your data.' },
+] as const;
+
+const appPy = `@coco.fn(memo=True)
+async def process_file(file, target):
+    html = render(await file.read_text())
+    target.declare_file(filename=file.name, content=html)
+
+@coco.fn
+async def app_main(sourcedir, outdir):
+    target = await coco.use_mount(localfs.declare_dir_target, outdir)
+    files = localfs.walk_dir(sourcedir)
+    await coco.mount_each(process_file, files.items(), target)
+
+app = coco.App(coco.AppConfig(name="docs"), app_main,
+               sourcedir="./docs", outdir="./out")
+app.update_blocking()`;
+---
+
+<!doctype html>
+<html lang="en" data-docs-lang="python">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content={THEME_COLOR} />
+    <title>{fullTitle}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" href={`${base}/img/favicon.ico`} />
+    <!-- Fonts self-hosted via @fontsource in src/styles/site.css. -->
+  </head>
+  <body class="docs-home">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <Topbar mobileSheetId="mobileSheet" />
+    <MobileSheet lang="python" />
+
+    <div class="layout dh-layout">
+      <Sidebar currentSlug="" lang="python" />
+
+      <main class="content dh-main" id="main-content" tabindex="-1">
+        <section class="dh-hero" aria-labelledby="dh-title">
+          <div>
+            <h1 class="dh-title" id="dh-title">CocoIndex documentation</h1>
+            <p class="dh-lede">
+              CocoIndex keeps a target in sync with its source. Declare the target as a
+              function of the source in plain Python. The Rust engine backfills it, tracks
+              lineage, and reprocesses only what changed.
+            </p>
+            <div class="dh-cta">
+              <a class="btn btn-primary btn-lg" href={doc('getting_started/quickstart')}>Quickstart</a>
+              <a class="btn btn-outline-muted btn-lg" href={doc('programming_guide/core_concepts')}>Core concepts</a>
+            </div>
+            <div class="dh-install" data-copy="pip install -U cocoindex">
+              <code><span class="p">$</span>pip install -U cocoindex</code>
+              <button class="dh-copy" type="button" aria-label="Copy install command">Copy</button>
+            </div>
+            <ul class="dh-facts">
+              <li><b>Python 3.11+</b></li>
+              <li><b>Rust engine</b>, parallel by default</li>
+              <li><b>Apache-2.0</b></li>
+            </ul>
+          </div>
+
+          <figure class="dh-fig" aria-label="An update after one source file changed: only that file is reprocessed">
+            <div class="dh-fig-head">
+              <span>./docs → ./out</span>
+              <span>update 2</span>
+            </div>
+            <div class="dh-fig-eq"><span class="c"># </span>target_state <span class="k">=</span> f(source_state)</div>
+            <table>
+              <thead>
+                <tr><th scope="col">Source</th><th scope="col">Target</th><th scope="col">Run</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>a.pdf</td><td>a.md</td><td>memo hit</td></tr>
+                <tr><td>b.pdf</td><td>b.md</td><td>memo hit</td></tr>
+                <tr class="delta"><td>c.pdf <span class="d">edited</span></td><td>c.md</td><td>reprocessed</td></tr>
+              </tbody>
+            </table>
+            <figcaption class="dh-fig-foot"><b>1 of 3</b> files re-ran. The other two targets came from the memo.</figcaption>
+          </figure>
+        </section>
+
+        <section class="dh-sec" aria-labelledby="dh-start">
+          <div class="dh-head">
+            <h2 id="dh-start">Start here</h2>
+            <p>Start with installation, a first pipeline, the core concepts, or the AI coding agent skill.</p>
+          </div>
+          <ul class="dh-list">
+            {start.map((c) => (
+              <li><a href={doc(c.slug)}><span class="t">{c.label}</span><span class="b">{c.body}</span><span class="m">{c.meta}</span></a></li>
+            ))}
+          </ul>
+        </section>
+
+        <section class="dh-sec" aria-labelledby="dh-model">
+          <div class="dh-head">
+            <h2 id="dh-model">Declare the target. Run the app.</h2>
+            <p>A pipeline is a function from source to target. You write it as batch code; CocoIndex runs it incrementally, in one pass or in live mode.</p>
+          </div>
+          <div class="dh-model">
+            <ol class="dh-steps">
+              <li>
+                <div>
+                  <h3>Declare the target state</h3>
+                  <p>Read a source such as <code>localfs</code>, <code>postgres</code>, Google Drive, S3 or Kafka. Transform it: chunk, embed, extract, resolve entities. Declare the rows, vectors or graph nodes that should exist.</p>
+                </div>
+              </li>
+              <li>
+                <div>
+                  <h3>Run it; only the Δ recomputes</h3>
+                  <p>The first run backfills the target. Every later run, or <code>live</code> mode, compares source and logic against the lineage and re-runs only the components that changed.</p>
+                  <a class="btn btn-outline-muted" href={doc('getting_started/quickstart')} style="margin-top:16px;">Follow the quickstart</a>
+                </div>
+              </li>
+            </ol>
+            <div class="dh-code" data-copy={appPy}>
+              <div class="bar">
+                <span class="fname">app.py</span>
+                <button class="dh-copy" type="button" aria-label="Copy code">Copy</button>
+              </div>
+<pre><code><span class="dec">@coco.fn</span>(memo=<span class="num">True</span>)
+<span class="kw">async def</span> <span class="fn">process_file</span>(file, target):
+    html = <span class="fn">render</span>(<span class="kw">await</span> file.read_text())
+    target.declare_file(filename=file.name, content=html)
+
+<span class="dec">@coco.fn</span>
+<span class="kw">async def</span> <span class="fn">app_main</span>(sourcedir, outdir):
+    target = <span class="kw">await</span> coco.use_mount(localfs.declare_dir_target, outdir)
+    files = localfs.walk_dir(sourcedir)
+    <span class="kw">await</span> coco.mount_each(process_file, files.items(), target)
+
+app = coco.<span class="ty">App</span>(coco.<span class="ty">AppConfig</span>(name=<span class="str">"docs"</span>), app_main,
+               sourcedir=<span class="str">"./docs"</span>, outdir=<span class="str">"./out"</span>)
+app.update_blocking()</code></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="dh-sec" aria-labelledby="dh-build">
+          <div class="dh-head">
+            <h2 id="dh-build">What people build with it</h2>
+            <p>Build vector indexes, knowledge graphs, and structured views for agents. Pipelines can include fan-out joins, symbol resolution, and relations across entities.</p>
+          </div>
+          <ul class="dh-list two">
+            {build.map((c) => (
+              <li><a href={c.href}><span class="t">{c.title}</span><span class="b">{c.body}</span><span class="m">{c.meta}</span></a></li>
+            ))}
+          </ul>
+        </section>
+
+        <section class="dh-sec" aria-labelledby="dh-blocks">
+          <div class="dh-head">
+            <h2 id="dh-blocks">Sources, operations, targets</h2>
+            <p>
+              Connectors and operations share one interface, so any source can feed any target.
+              <a class="more" href={doc('connectors')}>All connectors →</a>
+            </p>
+          </div>
+          <div class="dh-blocks">
+            <div>
+              <h3>Sources</h3>
+              <div class="dh-chips">{sources.map((s) => <a class="dh-chip" href={doc(s.slug)}>{s.label}</a>)}</div>
+            </div>
+            <div>
+              <h3>Operations</h3>
+              <div class="dh-chips">{operations.map((s) => <a class="dh-chip" href={doc(s.slug)}>{s.label}</a>)}</div>
+            </div>
+            <div>
+              <h3>Targets</h3>
+              <div class="dh-chips">{targets.map((s) => <a class="dh-chip" href={doc(s.slug)}>{s.label}</a>)}</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="dh-sec" aria-labelledby="dh-open">
+          <div class="dh-head">
+            <h2 id="dh-open">Built in the open</h2>
+            <p>The engine, the connectors and these docs are developed in public under the Apache-2.0 license.</p>
+          </div>
+          <ul class="dh-list">
+            {community.map((c) => (
+              <li><a href={c.href}><span class="t">{c.title}</span><span class="b">{c.body}</span><span class="m">{c.meta}</span></a></li>
+            ))}
+          </ul>
+        </section>
+      </main>
+    </div>
+
+    <script is:inline>
+      // Copy buttons for the install command and the code sample. Reads the
+      // verbatim text from the wrapper's `data-copy` attribute.
+      (function () {
+        document.querySelectorAll('.docs-home [data-copy]').forEach((wrap) => {
+          const btn = wrap.querySelector('.dh-copy');
+          if (!btn) return;
+          btn.addEventListener('click', () => {
+            const text = wrap.getAttribute('data-copy') || '';
+            const done = () => { btn.textContent = 'Copied'; setTimeout(() => { btn.textContent = 'Copy'; }, 1500); };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done).catch(() => {});
+            }
+          });
+        });
+      })();
+    </script>
+
+    <Foot />
+    <Analytics />
+    <ScarfPixel pxid={SCARF_PIXEL_ID} />
+  </body>
+</html>

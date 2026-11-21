@@ -1,0 +1,1133 @@
+//! App lifecycle: builder, update loop, open/run convenience API.
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use futures::future::BoxFuture;
+
+use cocoindex_core::engine::app::{App as CoreApp, AppOpHandle, AppUpdateOptions};
+use cocoindex_core::engine::deadline::DeadlineContext;
+use cocoindex_core::engine::environment::{Environment as CoreEnvironment, EnvironmentSettings};
+use cocoindex_core::engine::progress_display::{ProgressDisplayOptions, show_progress};
+use cocoindex_core::engine::stats::{ProcessingStats, ProcessingStatsGroup, TERMINATED_VERSION};
+use cocoindex_core::engine::target_state::{
+    TargetStateProvider as CoreTargetStateProvider, TargetStateProviderRegistry,
+};
+use cocoindex_core::state::component_selector::ComponentSelector;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
+
+use crate::ctx::{ContextKey, ContextStore, Ctx};
+use crate::error::{Error, Result};
+use crate::live_component::{ExceptionContext, ExceptionHandler};
+use crate::profile::{Action, BoxedProcessor, RustProfile, Value};
+use crate::stats::{ComponentStats, RunStats, UpdateStats, UpdateStatus};
+use crate::target_state::STATIC_ROOT_PROVIDERS;
+use crate::typemap::TypeMap;
+
+// ---------------------------------------------------------------------------
+// Environment — the home for provided resources + LMDB settings
+// ---------------------------------------------------------------------------
+
+/// A CocoIndex environment: the LMDB store plus the resources shared with every
+/// app (and target sink) built from it. Build one with [`Environment::builder`],
+/// then create apps with [`Environment::app`]. Multiple environments (separate
+/// `db_path`s) can coexist for multi-tenancy or test isolation.
+///
+/// # Examples
+///
+/// ```no_run
+/// # use cocoindex::Environment;
+/// # async fn run() -> cocoindex::error::Result<()> {
+/// let env = Environment::builder()
+///     .db_path("./.cocoindex")
+///     .provide(String::from("shared resource"))
+///     .build()
+///     .await?;
+/// let app = env.app("MyApp").await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Clone)]
+pub struct Environment {
+    inner: Arc<EnvironmentInner>,
+}
+
+pub(crate) struct EnvironmentInner {
+    core_env: CoreEnvironment<RustProfile>,
+    db_path: PathBuf,
+    state: Arc<TypeMap>,
+    context: Arc<ContextStore>,
+    static_root_providers: StaticRootProviders,
+    max_inflight_components: Option<usize>,
+    shutdown_hooks: Mutex<Vec<ShutdownHook>>,
+    exception_handler: Option<ExceptionHandler>,
+}
+
+/// A teardown step registered with [`EnvironmentBuilder::on_shutdown`].
+type ShutdownHook = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
+
+/// Environment variable naming the state db path when a lifespan sets none.
+/// Read by [`Environment::from_registered`] (the `cocoindex` CLI path), as the
+/// Python SDK does; [`EnvironmentBuilder::build`] reads no environment variables.
+pub const DB_PATH_ENV: &str = "COCOINDEX_DB";
+/// Environment variable for the LMDB maximum number of named databases when a
+/// lifespan sets none (read by [`Environment::from_registered`]).
+pub const LMDB_MAX_DBS_ENV: &str = "COCOINDEX_LMDB_MAX_DBS";
+/// Environment variable for the LMDB map size in bytes when a lifespan sets
+/// none (read by [`Environment::from_registered`]).
+pub const LMDB_MAP_SIZE_ENV: &str = "COCOINDEX_LMDB_MAP_SIZE";
+
+/// Environment variable for the number of components an app runs at once
+/// when the builder sets none, read when the app is created, as in Python.
+pub const MAX_INFLIGHT_COMPONENTS_ENV: &str = "COCOINDEX_MAX_INFLIGHT_COMPONENTS";
+
+/// LMDB maximum number of named databases when nothing sets it.
+pub const DEFAULT_LMDB_MAX_DBS: u32 = 1024;
+/// Components an app runs at once when nothing sets it (Python's default).
+pub const DEFAULT_MAX_INFLIGHT_COMPONENTS: usize = 1024;
+/// LMDB map size in bytes (4 GiB) when nothing sets it.
+pub const DEFAULT_LMDB_MAP_SIZE: usize = 0x1_0000_0000;
+
+/// The environment's registered [`StaticRootProvider`]s, by name.
+///
+/// [`StaticRootProvider`]: crate::target_state::StaticRootProvider
+pub(crate) type StaticRootProviders =
+    Arc<HashMap<&'static str, CoreTargetStateProvider<RustProfile>>>;
+
+impl Environment {
+    /// Start building an environment.
+    pub fn builder() -> EnvironmentBuilder {
+        EnvironmentBuilder::new()
+    }
+
+    /// Build the environment the way the `cocoindex` CLI does: run every
+    /// `#[cocoindex::lifespan]` linked into this binary over a fresh builder,
+    /// then open the state db. This is the Rust analogue of Python's default
+    /// environment (`@coco.lifespan` + import): a user's own `main` and the
+    /// CLI initialize the identical environment.
+    ///
+    /// The db path must come from a lifespan (`builder.db_path(..)`) or from
+    /// the `COCOINDEX_DB` environment variable. `COCOINDEX_LMDB_MAX_DBS` and
+    /// `COCOINDEX_LMDB_MAP_SIZE` apply when a lifespan did not set them.
+    ///
+    /// # Errors
+    /// Returns an error if two `#[cocoindex::app]`s share a name, a lifespan
+    /// fails, no db path is configured, or the db cannot be opened.
+    pub async fn from_registered() -> Result<Environment> {
+        crate::registry::check_unique_app_names()?;
+        let mut builder = EnvironmentBuilder::new();
+        for lifespan in crate::registry::lifespans() {
+            builder = (lifespan.run)(builder).await.map_err(|e| {
+                Error::engine(format!(
+                    "lifespan {}::{} failed: {e}",
+                    lifespan.module, lifespan.name
+                ))
+            })?;
+        }
+        // The CLI-facing settings come from the environment, as in Python;
+        // a plain `build()` reads no environment variables.
+        if builder.db_path.is_none() {
+            let Some(db_path) = std::env::var_os(DB_PATH_ENV) else {
+                return Err(Error::engine(format!(
+                    "no state db path configured: call `builder.db_path(..)` in a \
+                     #[cocoindex::lifespan] or set the {DB_PATH_ENV} environment variable"
+                )));
+            };
+            builder.db_path = Some(PathBuf::from(db_path));
+        }
+        if builder.lmdb_max_dbs.is_none() {
+            builder.lmdb_max_dbs = env_setting(LMDB_MAX_DBS_ENV)?;
+        }
+        if builder.lmdb_map_size.is_none() {
+            builder.lmdb_map_size = env_setting(LMDB_MAP_SIZE_ENV)?;
+        }
+        builder.build().await
+    }
+
+    /// The directory of this environment's LMDB state db.
+    pub fn db_path(&self) -> &Path {
+        &self.inner.db_path
+    }
+
+    /// The engine environment, for `cocoindex::inspect`.
+    pub(crate) fn core(&self) -> &CoreEnvironment<RustProfile> {
+        &self.inner.core_env
+    }
+
+    /// Names of the apps that have persisted state in this environment's db.
+    pub(crate) async fn persisted_app_names(&self) -> Result<Vec<String>> {
+        Ok(cocoindex_core::inspect::db_inspect::list_app_names(&self.inner.core_env).await?)
+    }
+
+    /// Clear one app's state db namespace without reverting its target states
+    /// (the `cocoindex drop --db-only` operation). Use
+    /// [`App::drop_state`] to also revert targets.
+    pub(crate) async fn drop_app_db_only(&self, app_name: &str) -> Result<()> {
+        Ok(self.inner.core_env.storage().drop_app(app_name).await?)
+    }
+
+    /// Run the `on_shutdown` hooks (most recently registered first), then
+    /// close the state db. Hooks run once; a second call only closes.
+    /// Await every running update or drop before calling this. A live update
+    /// never ends on its own, and the SDK cannot stop one yet.
+    pub async fn shutdown(&self) {
+        // A poisoned lock still holds the hooks; run them anyway.
+        let hooks: Vec<ShutdownHook> = std::mem::take(
+            &mut *self
+                .inner
+                .shutdown_hooks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        for hook in hooks.into_iter().rev() {
+            hook().await;
+        }
+        self.inner.core_env.close().await;
+    }
+
+    /// Create an app in this environment. Multiple apps may share one
+    /// environment — each `name` is its own LMDB namespace and they share the
+    /// environment's provided resources.
+    ///
+    /// # Errors
+    /// Returns an error if the app's state store cannot be created.
+    pub async fn app(&self, name: &str) -> Result<App> {
+        // Resolved per app, as Python's `App.__init__` does: the builder's
+        // value, else the environment variable, else the default.
+        let max_inflight_components = match self.inner.max_inflight_components {
+            Some(limit) => limit,
+            None => {
+                env_setting(MAX_INFLIGHT_COMPONENTS_ENV)?.unwrap_or(DEFAULT_MAX_INFLIGHT_COMPONENTS)
+            }
+        };
+        let core_app = CoreApp::new(
+            name,
+            self.inner.core_env.clone(),
+            Some(max_inflight_components),
+        )
+        .await
+        .map_err(|e| Error::engine(format!("failed to create app: {e}")))?;
+
+        Ok(App {
+            inner: Arc::new(AppInner {
+                name: name.to_owned(),
+                core_app,
+                state: self.inner.state.clone(),
+                context: self.inner.context.clone(),
+                static_root_providers: self.inner.static_root_providers.clone(),
+                exception_handler: self.inner.exception_handler.clone(),
+            }),
+        })
+    }
+
+    /// Create an app in this environment (blocking). Convenience for sync
+    /// callers — awaits [`Self::app`] on the engine's runtime.
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn app_blocking(&self, name: &str) -> Result<App> {
+        block_on(self.app(name))
+    }
+}
+
+/// Builder for [`Environment`]. Provided resources, the LMDB `db_path`, and
+/// other engine settings live here — apps are created from a built environment
+/// via [`Environment::app`].
+pub struct EnvironmentBuilder {
+    db_path: Option<PathBuf>,
+    lmdb_max_dbs: Option<u32>,
+    lmdb_map_size: Option<usize>,
+    max_inflight_components: Option<usize>,
+    state: TypeMap,
+    context: ContextStore,
+    shutdown_hooks: Vec<ShutdownHook>,
+    exception_handler: Option<ExceptionHandler>,
+}
+
+impl EnvironmentBuilder {
+    fn new() -> Self {
+        Self {
+            db_path: None,
+            lmdb_max_dbs: None,
+            lmdb_map_size: None,
+            max_inflight_components: None,
+            state: TypeMap::new(),
+            context: ContextStore::default(),
+            shutdown_hooks: Vec::new(),
+            exception_handler: None,
+        }
+    }
+
+    /// Set the LMDB database directory. Default: `./coco_state`
+    /// ([`Environment::from_registered`] falls back to `COCOINDEX_DB` instead).
+    pub fn db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.db_path = Some(path.into());
+        self
+    }
+
+    /// Set the LMDB maximum number of named databases. Default: 1024
+    /// ([`Environment::from_registered`] reads `COCOINDEX_LMDB_MAX_DBS` first).
+    pub fn lmdb_max_dbs(mut self, value: u32) -> Self {
+        self.lmdb_max_dbs = Some(value);
+        self
+    }
+
+    /// Set the LMDB map size in bytes. Default: 4 GiB
+    /// ([`Environment::from_registered`] reads `COCOINDEX_LMDB_MAP_SIZE` first).
+    pub fn lmdb_map_size(mut self, value: usize) -> Self {
+        self.lmdb_map_size = Some(value);
+        self
+    }
+
+    /// Register a teardown step for [`Environment::shutdown`]. Hooks run in
+    /// reverse registration order, before the state db is closed — the Rust
+    /// analogue of the code after `yield` in a Python lifespan.
+    pub fn on_shutdown<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.shutdown_hooks.push(Box::new(move || Box::pin(hook())));
+        self
+    }
+
+    /// Route the failures of every background-mounted component in this
+    /// environment ([`Ctx::mount`], [`Ctx::mount_live`], `auto_refresh`, …)
+    /// through `handler`: the outermost handler of each component's chain,
+    /// which [`Ctx::with_exception_handler`] extends. The Rust analogue of
+    /// Python's `builder.set_exception_handler`. The handler returns `Ok(())`
+    /// to swallow a failure or `Err(_)` to propagate it to the mount's handle;
+    /// without one, a failure is logged.
+    ///
+    /// [`Ctx::mount`]: crate::Ctx::mount
+    /// [`Ctx::mount_live`]: crate::Ctx::mount_live
+    /// [`Ctx::with_exception_handler`]: crate::Ctx::with_exception_handler
+    pub fn exception_handler<H>(mut self, handler: H) -> Self
+    where
+        H: Fn(&Error, &ExceptionContext) -> Result<()> + Send + Sync + 'static,
+    {
+        self.exception_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Limit the number of concurrently processing components (per app).
+    /// Default: the `COCOINDEX_MAX_INFLIGHT_COMPONENTS` environment variable
+    /// when the app is created, else 1024, as in Python.
+    pub fn max_inflight_components(mut self, value: usize) -> Self {
+        self.max_inflight_components = Some(value);
+        self
+    }
+
+    /// Inject a shared resource. Retrieved later via `ctx.get::<T>()`.
+    /// The type IS the key — each type can only be provided once.
+    ///
+    /// # Panics
+    /// Panics if a value of type `T` has already been provided.
+    pub fn provide<T: Send + Sync + 'static>(mut self, value: T) -> Self {
+        if self.state.contains::<T>() {
+            panic!(
+                "Environment::provide: type `{}` has already been provided",
+                std::any::type_name::<T>()
+            );
+        }
+        self.state.insert(value);
+        self
+    }
+
+    /// Inject a shared resource by named [`ContextKey`].
+    ///
+    /// Named keys are useful when multiple resources share the same Rust type
+    /// and carry change-tracking.
+    ///
+    /// # Panics
+    /// Panics if a change-tracked key cannot fingerprint the provided value.
+    pub fn provide_key<T: Send + Sync + 'static>(mut self, key: &ContextKey<T>, value: T) -> Self {
+        self.context
+            .provide(key, value)
+            .unwrap_or_else(|e| panic!("Environment::provide_key({}): {e}", key.name()));
+        self
+    }
+
+    /// Build the environment, opening (or creating) the LMDB database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB database environment fails to initialize
+    /// (e.g., due to permissions, disk space, or a corrupted state directory).
+    pub async fn build(mut self) -> Result<Environment> {
+        // Register every `#[coco::function]`'s logic fingerprint into the engine's
+        // logic set, so memo entries that depend on them validate correctly
+        // (see `crate::logic`). Idempotent across builds.
+        crate::logic::register_all_fn_logic();
+
+        let db_path = self
+            .db_path
+            .unwrap_or_else(|| PathBuf::from("./coco_state"));
+        let lmdb_max_dbs = self.lmdb_max_dbs.unwrap_or(DEFAULT_LMDB_MAX_DBS);
+        let lmdb_map_size = self.lmdb_map_size.unwrap_or(DEFAULT_LMDB_MAP_SIZE);
+
+        let settings = EnvironmentSettings {
+            db_path: db_path.clone(),
+            lmdb_max_dbs,
+            lmdb_map_size,
+        };
+        let mut registry = TargetStateProviderRegistry::new(Default::default());
+        let mut static_root_providers = HashMap::new();
+        for def in STATIC_ROOT_PROVIDERS {
+            let provider = registry
+                .register_root(def.name().to_string(), def.make_handler())
+                .map_err(Error::from)?;
+            static_root_providers.insert(def.name(), provider);
+        }
+        let providers = Arc::new(std::sync::Mutex::new(registry));
+        let core_env = CoreEnvironment::<RustProfile>::new(settings, providers, ())
+            .await
+            .map_err(|e| Error::engine(format!("failed to open LMDB: {e}")))?;
+        self.context.register_logic(&core_env);
+        self.context.register_initial_states(&core_env).await?;
+
+        Ok(Environment {
+            inner: Arc::new(EnvironmentInner {
+                core_env,
+                db_path,
+                state: Arc::new(self.state),
+                context: Arc::new(self.context),
+                static_root_providers: Arc::new(static_root_providers),
+                max_inflight_components: self.max_inflight_components,
+                shutdown_hooks: Mutex::new(self.shutdown_hooks),
+                exception_handler: self.exception_handler,
+            }),
+        })
+    }
+
+    /// Build the environment (blocking). Convenience for sync callers.
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn build_blocking(self) -> Result<Environment> {
+        block_on(self.build())
+    }
+}
+
+/// Run `fut` to completion on the engine's runtime, for the `*_blocking`
+/// wrappers. The runtime is shared by every app in the process (the engine
+/// spawns component tasks on it), so no wrapper builds a runtime of its own.
+///
+/// # Panics
+/// Panics if called from within an async runtime; use the async form there.
+fn block_on<F: Future>(fut: F) -> F::Output {
+    cocoindex_core::engine::runtime::get_runtime().block_on(fut)
+}
+
+/// Read an integer setting from the environment; `Ok(None)` when unset.
+fn env_setting<T: std::str::FromStr>(name: &str) -> Result<Option<T>> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<T>()
+            .map(Some)
+            .map_err(|_| Error::engine(format!("{name} must be an integer, got {raw:?}"))),
+        Err(_) => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AppBuilder — single-app convenience (no provided resources). To provide
+// shared resources, use `Environment::builder().provide(…).build()` then
+// `env.app(name)`.
+// ---------------------------------------------------------------------------
+
+pub struct AppBuilder {
+    name: String,
+    env: EnvironmentBuilder,
+}
+
+impl AppBuilder {
+    /// Set the LMDB database directory. Default: `./coco_state`.
+    pub fn db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.env = self.env.db_path(path);
+        self
+    }
+
+    /// Set the LMDB maximum number of named databases.
+    pub fn lmdb_max_dbs(mut self, value: u32) -> Self {
+        self.env = self.env.lmdb_max_dbs(value);
+        self
+    }
+
+    /// Set the LMDB map size in bytes.
+    pub fn lmdb_map_size(mut self, value: usize) -> Self {
+        self.env = self.env.lmdb_map_size(value);
+        self
+    }
+
+    /// Limit the number of concurrently processing components.
+    pub fn max_inflight_components(mut self, value: usize) -> Self {
+        self.env = self.env.max_inflight_components(value);
+        self
+    }
+
+    /// Build the app. Creates a single-app environment with no provided
+    /// resources, then the app. To provide resources, use
+    /// [`Environment::builder`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB database environment fails to initialize.
+    pub async fn build(self) -> Result<App> {
+        self.env.build().await?.app(&self.name).await
+    }
+
+    /// Build the app (blocking). Convenience for sync callers.
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn build_blocking(self) -> Result<App> {
+        block_on(self.build())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provide_panics_on_duplicate_type() {
+        let result = std::panic::catch_unwind(|| {
+            let _ = Environment::builder().provide(1u32).provide(2u32);
+        });
+        assert!(result.is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
+pub(crate) struct AppInner {
+    pub(crate) name: String,
+    pub(crate) core_app: CoreApp<RustProfile>,
+    pub(crate) state: Arc<TypeMap>,
+    pub(crate) context: Arc<ContextStore>,
+    pub(crate) static_root_providers: StaticRootProviders,
+    /// The environment's handler, the root of every component's handler chain.
+    pub(crate) exception_handler: Option<ExceptionHandler>,
+}
+
+#[derive(Clone)]
+pub struct App {
+    pub(crate) inner: Arc<AppInner>,
+}
+
+impl App {
+    /// Convenience: open an app with a specific DB path. Equivalent to
+    /// `App::builder(name).db_path(db_path).build().await`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use cocoindex::app::App;
+    /// # async fn run() -> cocoindex::error::Result<()> {
+    /// let app = App::open("my_app", "./data").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB database environment fails to initialize.
+    pub async fn open(name: &str, db_path: impl Into<PathBuf>) -> Result<App> {
+        App::builder(name).db_path(db_path).build().await
+    }
+
+    /// Convenience: synchronously open an app with a specific DB path. Same
+    /// as [`Self::open`] but blocks on the engine's runtime.
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn open_blocking(name: &str, db_path: impl Into<PathBuf>) -> Result<App> {
+        App::builder(name).db_path(db_path).build_blocking()
+    }
+
+    /// Start building a single-app environment. Name determines the LMDB
+    /// database namespace. To provide shared resources, use
+    /// [`Environment::builder`] then [`Environment::app`] instead.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use cocoindex::app::App;
+    /// # async fn run() -> cocoindex::error::Result<()> {
+    /// let app = App::builder("my_app").db_path("./data").build().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn builder(name: &str) -> AppBuilder {
+        AppBuilder {
+            name: name.to_owned(),
+            env: EnvironmentBuilder::new(),
+        }
+    }
+
+    /// Run the pipeline (async), returning statistics. The closure receives
+    /// a `Ctx` for scoping, memoization, and file output.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use cocoindex::app::App;
+    /// # async fn run() -> cocoindex::error::Result<()> {
+    /// let app = App::open("my_app", "./data").await?;
+    /// let stats = app.run(|ctx| async move {
+    ///     // ... pipeline logic ...
+    ///     Ok(())
+    /// }).await?;
+    /// println!("Stats: {stats}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the closure returns an error, or if internal engine
+    /// orchestration fails.
+    pub async fn run<F, Fut, T>(&self, f: F) -> Result<RunStats>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let start = Instant::now();
+        let (_result, processing_stats) =
+            self.update_with_stats(UpdateOptions::default(), f).await?;
+        let mut run_stats = Self::run_stats_from_processing(&processing_stats);
+        run_stats.elapsed = start.elapsed();
+        Ok(run_stats)
+    }
+
+    /// Run the pipeline (async). The closure receives a `Ctx` for mounting
+    /// components and calling `memo::cached()`.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use cocoindex::app::App;
+    /// # async fn doc() -> cocoindex::error::Result<()> {
+    /// let app = App::open("my_app", "./data").await?;
+    /// app.update(|ctx| async move {
+    ///     // ... update logic ...
+    ///     Ok(())
+    /// }).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the provided closure returns an error, or if internal engine
+    /// orchestration fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The update runs as a task on the engine's runtime. Dropping the
+    /// returned future (or the [`UpdateHandle`] of [`App::start_update`])
+    /// does not stop it: it runs to completion, and a live update runs until
+    /// the process exits. The same holds for [`App::run`],
+    /// [`App::update_with_options`], [`App::preview`] and
+    /// [`App::drop_state`].
+    pub async fn update<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let (result, _stats) = self.update_with_stats(UpdateOptions::default(), f).await?;
+        Ok(result)
+    }
+
+    /// Run the pipeline once with explicit update options.
+    pub async fn update_with_options<F, Fut, T>(&self, options: UpdateOptions, f: F) -> Result<T>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let (result, _stats) = self.update_with_stats(options, f).await?;
+        Ok(result)
+    }
+
+    async fn update_with_stats<F, Fut, T>(
+        &self,
+        options: UpdateOptions,
+        f: F,
+    ) -> Result<(T, ProcessingStats)>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let report_to_stdout = options.report_to_stdout;
+        let progress_refresh_interval = options.progress_refresh_interval;
+        let handle = self.start_update_with_options(options, f)?;
+        let processing_stats = handle.core.stats().clone();
+        let result = if report_to_stdout {
+            let value = show_progress(
+                handle.into_core(),
+                ProgressDisplayOptions::from_refresh_secs(
+                    progress_refresh_interval.map(|d| d.as_secs_f64()),
+                ),
+            )
+            .await
+            .map_err(Error::from)?;
+            value.deserialize()?
+        } else {
+            handle.result().await?
+        };
+        Ok((result, processing_stats))
+    }
+
+    /// Run the pipeline in preview mode: compute the target actions that would
+    /// be applied, without applying them. Returns the collected actions (cf.
+    /// Python's `App.update(preview=True)`).
+    pub async fn preview<F, Fut, T>(&self, f: F) -> Result<Vec<PreviewAction>>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let options = UpdateOptions {
+            preview: true,
+            ..UpdateOptions::default()
+        };
+        let handle = self.start_update_with_options::<F, Fut, T>(options, f)?;
+        handle.preview_actions().await
+    }
+
+    /// Run the pipeline in preview mode (blocking). Convenience for sync callers.
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn preview_blocking<F, Fut, T>(&self, f: F) -> Result<Vec<PreviewAction>>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        block_on(self.preview(f))
+    }
+
+    /// Start an update and return a handle for progress/stat polling.
+    pub fn start_update<F, Fut, T>(&self, f: F) -> Result<UpdateHandle<T>>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        self.start_update_with_options(UpdateOptions::default(), f)
+    }
+
+    /// Start an update with explicit options.
+    pub fn start_update_with_options<F, Fut, T>(
+        &self,
+        options: UpdateOptions,
+        f: F,
+    ) -> Result<UpdateHandle<T>>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        let state = self.inner.clone();
+        // Root inherits the update options' timeout; the same value goes to
+        // core as AppUpdateOptions.deadline below.
+        let deadline = options.timeout.map_or(DeadlineContext::NONE, |timeout| {
+            DeadlineContext::NONE.with_timeout(timeout)
+        });
+        let processor = BoxedProcessor::new(
+            move |comp_ctx| {
+                let ctx = Ctx::new(Some(comp_ctx), state.clone(), deadline);
+                Box::pin(async move {
+                    let ret = f(ctx).await?;
+                    Value::from_serializable(&ret)
+                        .map_err(|e| Error::engine(format!("failed to serialize app result: {e}")))
+                })
+            },
+            None,
+            format!("app:{}", self.inner.name),
+        );
+
+        let core_options = AppUpdateOptions {
+            full_reprocess: options.full_reprocess,
+            live: options.live,
+            deadline,
+            component_selector: options.component_selector,
+        };
+
+        // In preview mode the engine collects target actions into this shared
+        // buffer instead of applying them. The element type (`Action`) is
+        // inferred from the `update` call below — the core's collector alias is
+        // crate-private, but the underlying `Arc<Mutex<Vec<_>>>` is not.
+        let preview_collector: Option<Arc<std::sync::Mutex<Vec<Action>>>> = options
+            .preview
+            .then(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+
+        let (core, preview_collector) = self
+            .inner
+            .core_app
+            .update(
+                processor,
+                core_options,
+                self.inner.context.clone(),
+                preview_collector,
+            )
+            .map_err(|e| Error::engine(format!("{e}")))?;
+        Ok(UpdateHandle {
+            core,
+            preview_collector,
+            _marker: std::marker::PhantomData,
+        })
+    }
+
+    pub(crate) fn run_stats_from_processing(processing_stats: &ProcessingStats) -> RunStats {
+        let mut run_stats = RunStats::default();
+        for group in processing_stats.snapshot().stats.values() {
+            run_stats.processed += group.num_processed();
+            run_stats.skipped += group.num_unchanged;
+            run_stats.written += group.num_adds;
+            run_stats.written += group.num_reprocesses;
+            run_stats.deleted += group.num_deletes;
+        }
+        run_stats
+    }
+
+    /// Build the detailed per-component [`UpdateStats`] from the engine's
+    /// processing stats (preserves the per-operation breakdown that
+    /// [`RunStats`] flattens away).
+    pub(crate) fn update_stats_from_processing(processing_stats: &ProcessingStats) -> UpdateStats {
+        let snapshot = processing_stats.snapshot();
+        let component_stats = |group: &ProcessingStatsGroup| ComponentStats {
+            num_execution_starts: group.num_execution_starts,
+            num_unchanged: group.num_unchanged,
+            num_adds: group.num_adds,
+            num_deletes: group.num_deletes,
+            num_reprocesses: group.num_reprocesses,
+            num_errors: group.num_errors,
+        };
+        let by_component = snapshot
+            .stats
+            .iter()
+            .map(|(name, group)| (name.clone(), component_stats(group)))
+            .collect();
+        let status = if snapshot.ready {
+            UpdateStatus::Ready
+        } else {
+            UpdateStatus::Running
+        };
+        UpdateStats {
+            by_component,
+            status,
+            in_groups: component_stats(&snapshot.in_groups),
+        }
+    }
+
+    /// Run the pipeline (blocking). Convenience for sync callers — runs on
+    /// the engine's runtime.
+    ///
+    /// # Panics
+    /// Panics if called from within an active tokio runtime (use `update`
+    /// instead in async contexts).
+    pub fn update_blocking<F, Fut, T>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        block_on(self.update(f))
+    }
+
+    /// Run the pipeline once with explicit update options (blocking).
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn update_blocking_with_options<F, Fut, T>(&self, options: UpdateOptions, f: F) -> Result<T>
+    where
+        F: FnOnce(Ctx) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T>> + Send + 'static,
+        T: Serialize + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        block_on(self.update_with_options(options, f))
+    }
+
+    /// Start dropping all persisted app state and return a handle.
+    pub fn start_drop_state(&self) -> Result<DropHandle> {
+        let core = self
+            .inner
+            .core_app
+            .drop_app(self.inner.context.clone())
+            .map_err(|e| Error::engine(format!("{e}")))?;
+        Ok(DropHandle { core })
+    }
+
+    /// Drop all persisted state (LMDB data). Irreversible.
+    pub async fn drop_state(&self) -> Result<()> {
+        self.start_drop_state()?.result().await
+    }
+
+    /// Drop all persisted state (blocking). Convenience for sync callers.
+    ///
+    /// # Panics
+    /// Panics if called from within an async runtime; use the async form there.
+    pub fn drop_state_blocking(&self) -> Result<()> {
+        block_on(self.drop_state())
+    }
+
+    /// Get the app name.
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+}
+
+/// Options for a Rust SDK app update.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateOptions {
+    pub full_reprocess: bool,
+    pub live: bool,
+    /// Apply a cooperative deadline to this update. The core stores this as an
+    /// absolute monotonic deadline and checks it at engine checkpoints.
+    pub timeout: Option<Duration>,
+    /// Compute target actions without applying them to external systems. The
+    /// planned actions are collected and retrievable via
+    /// [`UpdateHandle::preview_actions`] / [`App::preview`] (cf. Python's
+    /// `App.update(preview=True)`).
+    pub preview: bool,
+    /// Periodically print processing progress to stdout while the update runs
+    /// (cf. Python's `update_blocking(report_to_stdout=True)`).
+    pub report_to_stdout: bool,
+    /// When `report_to_stdout` is set, refresh the stdout display at this
+    /// interval. `None` uses the engine's default cadence.
+    pub progress_refresh_interval: Option<Duration>,
+    /// Run only the selected components and what reaches them, leaving every
+    /// other component as it is (cf. Python's
+    /// `App.update(component_selector=...)`). This filters background mounts
+    /// (`Ctx::mount`, `Ctx::mount_each`, live components). Foreground children
+    /// (`Ctx::scope`, `use_mount!`, `use_mount_each!`) return values, so they
+    /// always run.
+    pub component_selector: Option<ComponentSelector>,
+}
+
+/// Options for [`Ctx::stats_group_with_options`](crate::Ctx::stats_group_with_options).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatsGroupOptions {
+    /// Print the group's scoped progress to stdout.
+    pub report_to_stdout: bool,
+    /// When `report_to_stdout` is set, refresh the stdout display at this
+    /// interval. `None` uses the engine's default cadence. Ignored when
+    /// `report_to_stdout` is `false`.
+    pub refresh_interval: Option<Duration>,
+}
+
+/// Outcome of waiting on a running operation via [`UpdateHandle::changed`] /
+/// [`DropHandle::changed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Progress {
+    /// The operation made progress; carries the new monotonic version counter.
+    Changed(u64),
+    /// The operation has terminated; no further changes will occur.
+    Done,
+}
+
+impl Progress {
+    fn from_version(version: u64) -> Self {
+        if version == TERMINATED_VERSION {
+            Progress::Done
+        } else {
+            Progress::Changed(version)
+        }
+    }
+
+    /// Whether the operation has finished.
+    pub fn is_done(self) -> bool {
+        matches!(self, Progress::Done)
+    }
+}
+
+/// A target-state change computed during a [preview](App::preview) run but not
+/// applied to any external system.
+pub enum PreviewAction {
+    /// A target state that would be created.
+    Create(PreviewValue),
+    /// A target state that would be updated.
+    Update(PreviewValue),
+    /// A target state that would be deleted.
+    Delete(PreviewValue),
+}
+
+/// The serialized payload of a [`PreviewAction`]. Decode it to the concrete
+/// target-state type with [`PreviewValue::decode`].
+pub struct PreviewValue(Value);
+
+impl PreviewValue {
+    /// Decode the payload into the target-state type that produced it.
+    pub fn decode<V: DeserializeOwned>(&self) -> Result<V> {
+        self.0.deserialize()
+    }
+}
+
+impl PreviewAction {
+    fn from_action(action: Action) -> Self {
+        match action {
+            Action::Create(v) => PreviewAction::Create(PreviewValue(v)),
+            Action::Update(v) => PreviewAction::Update(PreviewValue(v)),
+            Action::Delete(v) => PreviewAction::Delete(PreviewValue(v)),
+        }
+    }
+}
+
+impl std::fmt::Debug for PreviewAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            PreviewAction::Create(_) => "Create",
+            PreviewAction::Update(_) => "Update",
+            PreviewAction::Delete(_) => "Delete",
+        };
+        write!(f, "PreviewAction::{kind}")
+    }
+}
+
+/// Handle returned by [`App::start_update`]. Dropping it does not stop the
+/// update (see the cancellation notes on [`App::update`]).
+pub struct UpdateHandle<T> {
+    core: AppOpHandle<Value>,
+    preview_collector: Option<Arc<std::sync::Mutex<Vec<Action>>>>,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> UpdateHandle<T>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
+    pub(crate) fn into_core(self) -> AppOpHandle<Value> {
+        self.core
+    }
+
+    /// Drive the (preview) update to completion and return the planned target
+    /// actions. Only meaningful when the update was started with
+    /// [`UpdateOptions::preview`] set; otherwise returns an empty list.
+    pub async fn preview_actions(self) -> Result<Vec<PreviewAction>> {
+        let collector = self.preview_collector.clone();
+        // Run the pipeline to completion (the app result is discarded — preview
+        // callers want the actions, not the return value).
+        self.core.result().await.map_err(Error::from)?;
+        let actions = collector
+            .map(|c| std::mem::take(&mut *c.lock().unwrap_or_else(|e| e.into_inner())))
+            .unwrap_or_default();
+        Ok(actions
+            .into_iter()
+            .map(PreviewAction::from_action)
+            .collect())
+    }
+    /// A point-in-time snapshot of processing statistics for live progress.
+    ///
+    /// Note: [`RunStats::elapsed`] is not populated for in-flight snapshots
+    /// (it is only set by [`App::run`] once the run completes).
+    pub fn stats_snapshot(&self) -> RunStats {
+        App::run_stats_from_processing(self.core.stats())
+    }
+
+    /// A detailed, per-component snapshot of update statistics (mirrors Python's
+    /// `UpdateHandle.stats()`). Use this instead of [`stats_snapshot`](Self::stats_snapshot)
+    /// when you need the per-operation breakdown, error counts, or in-flight counts.
+    pub fn detailed_stats_snapshot(&self) -> UpdateStats {
+        App::update_stats_from_processing(self.core.stats())
+    }
+
+    /// Wait for the operation to advance, returning whether it progressed or
+    /// terminated. Loop until [`Progress::Done`] to drive it to completion.
+    pub async fn changed(&mut self) -> Result<Progress> {
+        let version = self.core.changed().await.map_err(Error::from)?;
+        Ok(Progress::from_version(version))
+    }
+
+    pub async fn result(self) -> Result<T> {
+        let value = self.core.result().await.map_err(Error::from)?;
+        value.deserialize()
+    }
+}
+
+/// Handle returned by [`App::start_drop_state`]. Dropping it does not stop
+/// the drop (see the cancellation notes on [`App::update`]).
+pub struct DropHandle {
+    core: AppOpHandle<()>,
+}
+
+impl DropHandle {
+    /// A point-in-time snapshot of processing statistics for live progress.
+    pub fn stats_snapshot(&self) -> RunStats {
+        App::run_stats_from_processing(self.core.stats())
+    }
+
+    /// A detailed, per-component snapshot of statistics (see
+    /// [`UpdateHandle::detailed_stats_snapshot`]).
+    pub fn detailed_stats_snapshot(&self) -> UpdateStats {
+        App::update_stats_from_processing(self.core.stats())
+    }
+
+    /// Wait for the operation to advance, returning whether it progressed or
+    /// terminated. Loop until [`Progress::Done`] to drive it to completion.
+    pub async fn changed(&mut self) -> Result<Progress> {
+        let version = self
+            .core
+            .changed()
+            .await
+            .map_err(|e| Error::engine(format!("{e}")))?;
+        Ok(Progress::from_version(version))
+    }
+
+    pub async fn result(self) -> Result<()> {
+        self.core
+            .result()
+            .await
+            .map_err(|e| Error::engine(format!("{e}")))
+    }
+}
+
+/// Handle returned by [`Ctx::stats_group`](crate::Ctx::stats_group).
+#[derive(Clone)]
+pub struct StatsGroupHandle {
+    stats: ProcessingStats,
+    version_rx: watch::Receiver<u64>,
+}
+
+impl StatsGroupHandle {
+    pub(crate) fn new(stats: ProcessingStats) -> Self {
+        let version_rx = stats.subscribe();
+        Self { stats, version_rx }
+    }
+
+    /// A point-in-time snapshot of this group's processing statistics.
+    pub fn stats_snapshot(&self) -> RunStats {
+        App::run_stats_from_processing(&self.stats)
+    }
+
+    /// A detailed, per-component snapshot of this group's statistics (see
+    /// [`UpdateHandle::detailed_stats_snapshot`]).
+    pub fn detailed_stats_snapshot(&self) -> UpdateStats {
+        App::update_stats_from_processing(&self.stats)
+    }
+
+    /// Wait for the group to advance, returning whether it progressed or
+    /// terminated. Loop until [`Progress::Done`] to watch the group through
+    /// completion.
+    pub async fn changed(&mut self) -> Result<Progress> {
+        self.version_rx
+            .changed()
+            .await
+            .map_err(|e| Error::engine(format!("{e}")))?;
+        Ok(Progress::from_version(*self.version_rx.borrow()))
+    }
+}

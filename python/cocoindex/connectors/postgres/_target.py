@@ -1,0 +1,1812 @@
+"""
+PostgreSQL target for CocoIndex.
+
+This module provides a two-level target state system for PostgreSQL:
+1. Table level: Creates/drops tables in the database
+2. Row level: Upserts/deletes rows within tables
+"""
+
+from __future__ import annotations
+
+import asyncio
+import datetime
+import decimal
+import ipaddress
+import json
+import logging
+import numbers
+import re
+import uuid
+import warnings
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Generic,
+    Literal,
+    NamedTuple,
+    Sequence,
+    overload,
+)
+
+
+from typing_extensions import TypeVar, deprecated
+
+from cocoindex._internal.extras import install_hint
+
+try:
+    import asyncpg  # type: ignore
+except ImportError as e:
+    raise ImportError(
+        "asyncpg is required to use the PostgreSQL connector. "
+        + install_hint("postgres")
+    ) from e
+
+import numpy as np
+
+import cocoindex as coco
+from cocoindex.connectorkits import statediff, target
+from cocoindex.connectorkits.fingerprint import fingerprint_object
+from cocoindex._internal.datatype import (
+    AnyType,
+    MappingType,
+    SequenceType,
+    RecordType,
+    TypeChecker,
+    UnionType,
+    analyze_type_info,
+    is_record_type,
+)
+import msgspec
+
+from cocoindex.resources import schema as res_schema
+from cocoindex._internal.context_keys import ContextKey, ContextProvider
+
+logger = logging.getLogger(__name__)
+
+# Type aliases
+_RowKey = tuple[Any, ...]  # Primary key values as tuple
+_ROW_KEY_CHECKER = TypeChecker(tuple[Any, ...])
+_RowValue = dict[str, Any]  # Column name -> value
+_RowFingerprint = bytes
+ValueEncoder = Callable[[Any], Any]
+
+# asyncpg enforces a protocol limit of 32767 bind parameters per query.
+_BIND_LIMIT: int = 32767
+
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_identifier(name: str, kind: str = "identifier") -> None:
+    """Reject identifiers outside the unquoted-identifier allow-list.
+
+    PostgreSQL identifiers are quoted with double quotes when interpolated, but
+    quoting alone does not prevent injection if the input itself contains a
+    double-quote character. Mirroring the Doris connector's approach
+    (CVE-2026-28438), we error out immediately on anything that isn't a plain
+    unquoted identifier.
+    """
+    if not isinstance(name, str) or not _IDENTIFIER_RE.match(name):
+        raise ValueError(f"Invalid {kind}: {name!r}")
+
+
+def _qualified_table_name(table_name: str, pg_schema_name: str | None) -> str:
+    """Return a properly quoted (optionally schema-qualified) table name."""
+
+    if pg_schema_name:
+        return f'"{pg_schema_name}"."{table_name}"'
+    return f'"{table_name}"'
+
+
+# PostgreSQL truncates identifiers longer than this many bytes (NAMEDATALEN - 1).
+_MAX_IDENTIFIER_BYTES = 63
+
+
+def _truncated_identifier(name: str) -> str:
+    """Return the identifier PostgreSQL uses for ``name`` in a UTF-8 database.
+
+    PostgreSQL cuts a longer identifier to 63 bytes, backing off to a character
+    boundary.
+    """
+    return name.encode()[:_MAX_IDENTIFIER_BYTES].decode(errors="ignore")
+
+
+def _vector_index_name(table_name: str, index_name: str) -> str:
+    """The name of the PostgreSQL index for a declared vector index, untruncated."""
+    return f"{table_name}__vector__{index_name}"
+
+
+class PgType(NamedTuple):
+    """
+    Annotation to specify a PostgreSQL column type.
+
+    Use with `typing.Annotated` to override the default type mapping:
+
+    ```python
+    from typing import Annotated
+    from dataclasses import dataclass
+    from cocoindex.connectors.postgres import PgType
+
+    @dataclass
+    class MyRow:
+        # Use integer instead of default bigint
+        id: Annotated[int, PgType("integer")]
+        # Use real instead of default double precision
+        value: Annotated[float, PgType("real")]
+        # Use timestamp without timezone
+        created_at: Annotated[datetime.datetime, PgType("timestamp")]
+    ```
+    """
+
+    pg_type: str
+    encoder: ValueEncoder | None = None
+
+
+def _strip_nul(s: str) -> str:
+    """Strip U+0000 (NUL) bytes from a string.
+
+    Postgres ``text`` cannot contain NUL, and ``jsonb`` additionally rejects
+    the ``\\u0000`` escape on parse. ``str.replace`` returns the original
+    string object when no NUL is present, so this is allocation-free in the
+    common case.
+    """
+    return s.replace("\x00", "")
+
+
+def _sanitize_nul(value: Any) -> Any:
+    """Recursively strip NUL from strings, dict keys, and nested containers.
+
+    Applied to jsonb payloads before ``json.dumps`` and to array / composite
+    column values before they are bound to asyncpg.  Nested strings — and
+    dict keys — are cleaned so Postgres never sees ``U+0000``.
+
+    ``tuple`` inputs are returned as ``tuple`` (asyncpg relies on ``tuple``
+    for Postgres composite types); ``list`` inputs remain ``list``.
+    """
+    if isinstance(value, str):
+        return _strip_nul(value)
+    if isinstance(value, dict):
+        return {_sanitize_nul(k): _sanitize_nul(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_sanitize_nul(v) for v in value)
+    if isinstance(value, list):
+        return [_sanitize_nul(v) for v in value]
+    return value
+
+
+def _json_default(obj: Any) -> str:
+    """``json.dumps`` fallback that stringifies and strips NUL.
+
+    The pre-walk in ``_sanitize_nul`` runs before serialization and so cannot
+    see strings produced mid-stream by ``default`` (e.g., a non-JSON-native
+    object whose ``str()`` contains NUL). Stripping here closes that gap.
+    """
+    return _strip_nul(str(obj))
+
+
+def _json_encoder(value: Any) -> str:
+    """Encode a value to JSON string for asyncpg, stripping NUL from every string."""
+    return json.dumps(_sanitize_nul(value), default=_json_default)
+
+
+def _vector_encoder(value: Any) -> str:
+    """Encode a numpy array to pgvector text format, e.g. '[1.0,2.0,3.0]'."""
+    return "[" + ",".join(str(float(x)) for x in value) + "]"
+
+
+_PGVECTOR_TYPE_BASES: frozenset[str] = frozenset({"vector", "halfvec"})
+
+
+def _pgvector_type_base(pg_type: str) -> str | None:
+    """
+    Return the pgvector type base for a PostgreSQL type, if any.
+
+    Supports both dimensioned and undimensioned pgvector types, e.g. `vector`,
+    `vector(384)`, `halfvec`, and `halfvec(384)`.
+    """
+    t = pg_type.lower().strip()
+    for base in _PGVECTOR_TYPE_BASES:
+        if t == base or t.startswith(f"{base}("):
+            return base
+    return None
+
+
+def _is_pgvector_pg_type(pg_type: str) -> bool:
+    """
+    Return True if `pg_type` is a pgvector type (`vector(n)`, `halfvec(n)`, ...).
+
+    This is used for extension checks and validation.
+    """
+    return _pgvector_type_base(pg_type) is not None
+
+
+class _TypeMapping(NamedTuple):
+    """Mapping from Python type to PostgreSQL type with optional encoder."""
+
+    pg_type: str
+    encoder: ValueEncoder | None = None
+
+
+# Global mapping for leaf types
+# Based on asyncpg's type conversion: https://magicstack.github.io/asyncpg/current/usage.html#type-conversion
+# For types that map to multiple PostgreSQL types, uses the broader one.
+_LEAF_TYPE_MAPPINGS: dict[type, _TypeMapping] = {
+    # Boolean
+    bool: _TypeMapping("boolean"),
+    # Numeric types (use broader types)
+    int: _TypeMapping("bigint"),
+    float: _TypeMapping("double precision"),
+    decimal.Decimal: _TypeMapping("numeric"),
+    # NumPy scalar integer types (finer-grained)
+    np.int8: _TypeMapping("smallint"),
+    np.int16: _TypeMapping("smallint"),
+    np.int32: _TypeMapping("integer"),
+    np.int64: _TypeMapping("bigint"),
+    # NumPy scalar unsigned integer types (Postgres has no unsigned ints)
+    np.uint8: _TypeMapping("smallint"),  # always fits
+    np.uint16: _TypeMapping("integer"),  # can exceed smallint
+    np.uint32: _TypeMapping("bigint"),  # can exceed integer
+    np.uint64: _TypeMapping("numeric"),  # can exceed bigint
+    # Platform-dependent aliases
+    np.int_: _TypeMapping("bigint"),
+    np.uint: _TypeMapping("numeric"),
+    # NumPy scalar float types (finer-grained)
+    np.float16: _TypeMapping("real"),
+    np.float32: _TypeMapping("real"),
+    np.float64: _TypeMapping("double precision"),
+    # String types
+    str: _TypeMapping("text"),
+    bytes: _TypeMapping("bytea"),
+    # UUID
+    uuid.UUID: _TypeMapping("uuid"),
+    # Date/time types (use timezone-aware variants as broader)
+    datetime.date: _TypeMapping("date"),
+    datetime.time: _TypeMapping("time with time zone"),
+    datetime.datetime: _TypeMapping("timestamp with time zone"),
+    datetime.timedelta: _TypeMapping("interval"),
+    # Network types
+    ipaddress.IPv4Network: _TypeMapping("cidr"),
+    ipaddress.IPv6Network: _TypeMapping("cidr"),
+    ipaddress.IPv4Address: _TypeMapping("inet"),
+    ipaddress.IPv6Address: _TypeMapping("inet"),
+    ipaddress.IPv4Interface: _TypeMapping("inet"),
+    ipaddress.IPv6Interface: _TypeMapping("inet"),
+}
+
+# Default mapping for complex types that need JSON encoding
+_JSONB_MAPPING = _TypeMapping("jsonb", _json_encoder)
+
+
+async def _get_type_mapping(
+    python_type: Any, *, vector_schema: res_schema.VectorSchema | None = None
+) -> _TypeMapping:
+    """
+    Get the PostgreSQL type mapping for a Python type.
+
+    Based on asyncpg's type conversion table:
+    https://magicstack.github.io/asyncpg/current/usage.html#type-conversion
+
+    For types that map to multiple PostgreSQL types, uses the broader one.
+    Use `PgType` annotation with `typing.Annotated` to override the default.
+    """
+    type_info = analyze_type_info(python_type)
+
+    # Check for PgType annotation override
+    for annotation in type_info.annotations:
+        if isinstance(annotation, PgType):
+            return _TypeMapping(annotation.pg_type, annotation.encoder)
+
+    base_type = type_info.base_type
+
+    # Check direct leaf type mappings
+    if base_type in _LEAF_TYPE_MAPPINGS:
+        return _LEAF_TYPE_MAPPINGS[base_type]
+
+    # NumPy ndarray: map to pgvector type bases; dimension is handled at the schema layer.
+    if base_type is np.ndarray:
+        if vector_schema is None:
+            raise ValueError("VectorSpecProvider is required for NumPy ndarray type.")
+        if vector_schema.size <= 0:
+            raise ValueError(f"Invalid pgvector dimension: {vector_schema.size}")
+
+        # Default to `vector` (float32/float64/int64/etc.). Use `halfvec` for float16.
+        base = "halfvec" if vector_schema.dtype in (np.half, np.float16) else "vector"
+        return _TypeMapping(
+            pg_type=f"{base}({vector_schema.size})", encoder=_vector_encoder
+        )
+
+    elif vector_schema is not None:
+        raise ValueError(
+            f"VectorSpecProvider is only supported for NumPy ndarray type. Got type: {python_type}"
+        )
+
+    # Complex types that need JSON encoding
+    if isinstance(
+        type_info.variant, (SequenceType, MappingType, RecordType, UnionType, AnyType)
+    ):
+        return _JSONB_MAPPING
+
+    # Default fallback
+    return _JSONB_MAPPING
+
+
+class ColumnDef(NamedTuple):
+    """Definition of a table column."""
+
+    type: str  # PostgreSQL type (e.g., "text", "bigint", "jsonb", "vector(384)")
+    nullable: bool = True
+    encoder: ValueEncoder | None = (
+        None  # Optional encoder to convert value before sending to asyncpg
+    )
+
+
+# Type variable for row type
+RowT = TypeVar("RowT", default=dict[str, Any])
+
+
+@dataclass(slots=True)
+class TableSchema(Generic[RowT]):
+    """Schema definition for a PostgreSQL table."""
+
+    columns: dict[str, ColumnDef]  # column name -> definition
+    primary_key: list[str]  # Column names that form the primary key
+    row_type: type[RowT] | None  # The row type, if provided
+
+    def __init__(
+        self,
+        columns: dict[str, ColumnDef],
+        primary_key: list[str],
+        *,
+        row_type: type[RowT] | None = None,
+    ) -> None:
+        """
+        Create a TableSchema from pre-resolved column definitions.
+
+        For constructing from a record type, use the async classmethod
+        ``from_class`` instead.
+
+        Args:
+            columns: A dict mapping column names to ColumnDef.
+            primary_key: List of column names that form the primary key.
+            row_type: Optional original record type.
+        """
+        self.columns = columns
+        self.primary_key = primary_key
+        self.row_type = row_type
+
+        # Validate primary key columns exist
+        for pk in self.primary_key:
+            if pk not in self.columns:
+                raise ValueError(
+                    f"Primary key column '{pk}' not found in columns: {list(self.columns.keys())}"
+                )
+
+    @classmethod
+    async def from_class(
+        cls,
+        record_type: type[RowT],
+        primary_key: list[str],
+        *,
+        column_overrides: dict[str, PgType | res_schema.VectorSchemaProvider]
+        | None = None,
+    ) -> "TableSchema[RowT]":
+        """
+        Create a TableSchema from a record type (dataclass, NamedTuple, or Pydantic model).
+
+        Python types are automatically mapped to PostgreSQL types based on asyncpg's
+        type conversion.
+
+        Args:
+            record_type: A record type (dataclass, NamedTuple, or Pydantic model).
+            primary_key: List of column names that form the primary key.
+            column_overrides: Optional dict mapping column names to PgType or
+                              VectorSchemaProvider to override the default type mapping.
+        """
+        if not is_record_type(record_type):
+            raise TypeError(
+                f"record_type must be a record type (dataclass, NamedTuple, Pydantic model), "
+                f"got {type(record_type)}"
+            )
+        columns = await cls._columns_from_record_type(record_type, column_overrides)
+        return cls(columns, primary_key, row_type=record_type)
+
+    @staticmethod
+    async def _columns_from_record_type(
+        record_type: type,
+        column_overrides: dict[str, PgType | res_schema.VectorSchemaProvider] | None,
+    ) -> dict[str, ColumnDef]:
+        """Convert a record type to a dict of column name -> ColumnDef."""
+        record_info = RecordType(record_type)
+        columns: dict[str, ColumnDef] = {}
+
+        for field in record_info.fields:
+            type_info = analyze_type_info(field.type_hint)
+
+            all_annotations = []
+            if (
+                override := column_overrides and column_overrides.get(field.name)
+            ) is not None:
+                all_annotations.append(override)
+            all_annotations.extend(type_info.annotations)
+
+            # Extract PgType and VectorSchemaProvider from annotations
+            pg_type_annotation = next(
+                (t for t in all_annotations if isinstance(t, PgType)), None
+            )
+            vector_schema = await anext(
+                (
+                    s
+                    for annot in all_annotations
+                    if (s := await res_schema.get_vector_schema(annot)) is not None
+                ),
+                None,
+            )
+
+            # Determine type mapping
+            if pg_type_annotation is not None:
+                type_mapping = _TypeMapping(
+                    pg_type_annotation.pg_type, pg_type_annotation.encoder
+                )
+            else:
+                type_mapping = await _get_type_mapping(
+                    field.type_hint, vector_schema=vector_schema
+                )
+
+            columns[field.name] = ColumnDef(
+                type=type_mapping.pg_type.strip(),
+                nullable=type_info.nullable,
+                encoder=type_mapping.encoder,
+            )
+
+        return columns
+
+
+class _RowAction(NamedTuple):
+    """Action to perform on a row."""
+
+    key: _RowKey
+    value: _RowValue | None  # None means delete
+
+
+# --- Vector Index Attachment ---
+
+_PGVECTOR_OP_CLASS: dict[str, dict[str, str]] = {
+    "vector": {
+        "cosine": "vector_cosine_ops",
+        "l2": "vector_l2_ops",
+        "ip": "vector_ip_ops",
+    },
+    "halfvec": {
+        "cosine": "halfvec_cosine_ops",
+        "l2": "halfvec_l2_ops",
+        "ip": "halfvec_ip_ops",
+    },
+}
+
+
+def _pgvector_op_class(column: str, pg_type: str, metric: str) -> str:
+    type_base = _pgvector_type_base(pg_type)
+    if type_base is None:
+        raise ValueError(
+            f"Column '{column}' has PostgreSQL type '{pg_type}', which is not a pgvector type."
+        )
+
+    try:
+        return _PGVECTOR_OP_CLASS[type_base][metric]
+    except KeyError as e:
+        raise ValueError(
+            f"Unsupported pgvector metric '{metric}' for PostgreSQL type '{pg_type}'."
+        ) from e
+
+
+class _VectorIndexSpec(NamedTuple):
+    column: str
+    metric: str
+    op_class: str
+    method: str
+    lists: int | None
+    m: int | None
+    ef_construction: int | None
+
+
+_VectorIndexFingerprint = bytes
+
+
+class _VectorIndexAction(NamedTuple):
+    name: str
+    spec: _VectorIndexSpec | None  # None means delete
+
+
+class _VectorIndexHandler:
+    """Handler for vector index attachment states."""
+
+    _pool: asyncpg.Pool
+    _table_name: str
+    _schema_name: str | None
+    _sink: coco.TargetActionSink[_VectorIndexAction]
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        table_name: str,
+        pg_schema_name: str | None,
+    ) -> None:
+        self._pool = pool
+        self._table_name = table_name
+        self._schema_name = pg_schema_name
+        self._sink = coco.TargetActionSink.from_async_fn(self._apply_actions)
+
+    async def _apply_actions(
+        self, context_provider: ContextProvider, actions: Sequence[_VectorIndexAction]
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            # Drop deleted indexes first: a deleted index and a created one can
+            # share a PostgreSQL name after truncation, and the later drop would
+            # remove the new index.
+            for action in sorted(actions, key=lambda a: a.spec is not None):
+                index_base_name = _vector_index_name(self._table_name, action.name)
+                # `CREATE INDEX` takes an *unqualified* index name (it is created in
+                # the table's schema); `DROP INDEX` must be *schema-qualified* to
+                # find that index — an unqualified name resolves via `search_path`,
+                # which need not include the table's schema, so the drop would
+                # silently no-op and a later create would collide.
+                create_index_name = f'"{index_base_name}"'
+                drop_index_name = _qualified_table_name(
+                    index_base_name, self._schema_name
+                )
+                if action.spec is None:
+                    await conn.execute(f"DROP INDEX IF EXISTS {drop_index_name}")
+                else:
+                    # Drop + recreate
+                    await conn.execute(f"DROP INDEX IF EXISTS {drop_index_name}")
+                    table_name = _qualified_table_name(
+                        self._table_name, self._schema_name
+                    )
+                    with_params: list[str] = []
+                    if action.spec.method == "ivfflat":
+                        if action.spec.lists is not None:
+                            with_params.append(f"lists = {action.spec.lists}")
+                    elif action.spec.method == "hnsw":
+                        if action.spec.m is not None:
+                            with_params.append(f"m = {action.spec.m}")
+                        if action.spec.ef_construction is not None:
+                            with_params.append(
+                                f"ef_construction = {action.spec.ef_construction}"
+                            )
+                    with_clause = (
+                        f" WITH ({', '.join(with_params)})" if with_params else ""
+                    )
+                    sql = (
+                        f"CREATE INDEX {create_index_name} ON {table_name} "
+                        f'USING {action.spec.method} ("{action.spec.column}" {action.spec.op_class})'
+                        f"{with_clause}"
+                    )
+                    await conn.execute(sql)
+
+    def reconcile(
+        self,
+        key: coco.StableKey,
+        desired_state: _VectorIndexSpec | coco.NonExistenceType,
+        prev_possible_records: Collection[_VectorIndexFingerprint],
+        prev_may_be_missing: bool,
+        /,
+    ) -> coco.TargetReconcileOutput[_VectorIndexAction, _VectorIndexFingerprint] | None:
+        assert isinstance(key, str)
+        if coco.is_non_existence(desired_state):
+            if not prev_possible_records and not prev_may_be_missing:
+                return None
+            return coco.TargetReconcileOutput(
+                action=_VectorIndexAction(name=key, spec=None),
+                sink=self._sink,
+                tracking_record=coco.NON_EXISTENCE,
+            )
+
+        target_fp = fingerprint_object(desired_state)
+        if not prev_may_be_missing and all(
+            prev == target_fp for prev in prev_possible_records
+        ):
+            return None
+
+        return coco.TargetReconcileOutput(
+            action=_VectorIndexAction(name=key, spec=desired_state),
+            sink=self._sink,
+            tracking_record=target_fp,
+        )
+
+
+# --- SQL Command Attachment ---
+
+
+class _SqlCommandSpec(msgspec.Struct, frozen=True, array_like=True):
+    setup_sql: str
+    teardown_sql: str | None
+
+
+class _SqlCommandAction(NamedTuple):
+    name: str
+    spec: _SqlCommandSpec | None  # None means delete
+    prev_teardown_sql: str | None
+
+
+def _collect_teardown_sql(
+    prev_possible_records: Collection[_SqlCommandSpec],
+) -> str | None:
+    """Extract the first non-None teardown_sql from previous states."""
+    for prev in prev_possible_records:
+        if prev.teardown_sql is not None:
+            return prev.teardown_sql
+    return None
+
+
+class _SqlCommandHandler:
+    """Handler for SQL command attachment states."""
+
+    _pool: asyncpg.Pool
+    _table_name: str
+    _schema_name: str | None
+    _sink: coco.TargetActionSink[_SqlCommandAction]
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        table_name: str,
+        pg_schema_name: str | None,
+    ) -> None:
+        self._pool = pool
+        self._table_name = table_name
+        self._schema_name = pg_schema_name
+        self._sink = coco.TargetActionSink.from_async_fn(self._apply_actions)
+
+    async def _apply_actions(
+        self, context_provider: ContextProvider, actions: Sequence[_SqlCommandAction]
+    ) -> None:
+        async with self._pool.acquire() as conn:
+            for action in actions:
+                # Run teardown of previous state if applicable
+                if action.prev_teardown_sql is not None:
+                    await conn.execute(action.prev_teardown_sql)
+                # Run setup of new state if applicable
+                if action.spec is not None:
+                    await conn.execute(action.spec.setup_sql)
+
+    def reconcile(
+        self,
+        key: coco.StableKey,
+        desired_state: _SqlCommandSpec | coco.NonExistenceType,
+        prev_possible_records: Collection[_SqlCommandSpec],
+        prev_may_be_missing: bool,
+        /,
+    ) -> coco.TargetReconcileOutput[_SqlCommandAction, _SqlCommandSpec] | None:
+        assert isinstance(key, str)
+        if coco.is_non_existence(desired_state):
+            if not prev_possible_records and not prev_may_be_missing:
+                return None
+            prev_teardown = _collect_teardown_sql(prev_possible_records)
+            return coco.TargetReconcileOutput(
+                action=_SqlCommandAction(
+                    name=key, spec=None, prev_teardown_sql=prev_teardown
+                ),
+                sink=self._sink,
+                tracking_record=coco.NON_EXISTENCE,
+            )
+
+        if not prev_may_be_missing and all(
+            prev == desired_state for prev in prev_possible_records
+        ):
+            return None
+
+        prev_teardown = _collect_teardown_sql(prev_possible_records)
+        return coco.TargetReconcileOutput(
+            action=_SqlCommandAction(
+                name=key, spec=desired_state, prev_teardown_sql=prev_teardown
+            ),
+            sink=self._sink,
+            tracking_record=desired_state,
+        )
+
+
+# Rows per `unnest` upsert statement. Its parameter count doesn't grow with the
+# row count, so the bind limit doesn't apply; throughput is flat from about
+# 1,000 to 8,000 rows per statement, and smaller statements spread a large
+# batch over more connections.
+_UNNEST_UPSERT_ROWS: int = 2000
+
+# Builtin scalar types (`pg_type.typname`) upserted through `unnest`, each as
+# one array parameter of that type: asyncpg encodes the elements with the same
+# codec it uses for a single value of the column.
+_UNNEST_SCALAR_TYPES: frozenset[str] = frozenset(
+    {
+        "bool",
+        "int2",
+        "int4",
+        "int8",
+        "float4",
+        "float8",
+        "numeric",
+        "text",
+        "varchar",
+        "bytea",
+        "uuid",
+        "date",
+        "time",
+        "timetz",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "json",
+        "jsonb",
+        "inet",
+        "cidr",
+    }
+)
+
+# Element types of the array columns upserted through `unnest`. `unnest` would
+# flatten an array-of-arrays parameter, so such a column is passed as `text[]`
+# of array literals (see `_array_literal`) and cast back in the select list.
+_UNNEST_ARRAY_ELEMENT_TYPES: frozenset[str] = frozenset(
+    {
+        "bool",
+        "int2",
+        "int4",
+        "int8",
+        "float4",
+        "float8",
+        "numeric",
+        "text",
+        "varchar",
+        "uuid",
+    }
+)
+
+# Types of a table's columns, with an array column reported by its element type.
+_COLUMN_TYPES_SQL = """
+SELECT a.attname AS name,
+       n.nspname AS type_schema,
+       coalesce(e.typname, t.typname) AS type_name,
+       e.oid IS NOT NULL AS is_array
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+LEFT JOIN pg_catalog.pg_type e ON t.typcategory = 'A' AND e.oid = t.typelem
+JOIN pg_catalog.pg_namespace n ON n.oid = coalesce(e.typnamespace, t.typnamespace)
+WHERE a.attrelid = pg_catalog.to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped
+"""
+
+
+def _array_literal(value: Any) -> str:
+    """Render a (possibly nested) list as a PostgreSQL array literal.
+
+    Covers the Python values of `_UNNEST_ARRAY_ELEMENT_TYPES` elements.
+    """
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            f"a list is expected for an array column, got {type(value).__name__!r}"
+        )
+    parts: list[str] = []
+    for v in value:
+        if v is None:
+            parts.append("NULL")
+        elif isinstance(v, str):
+            escaped = v.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'"{escaped}"')
+        elif isinstance(v, bool):
+            # `1` / `0` parse as both boolean and numeric elements; asyncpg
+            # likewise takes a bool for an integer.
+            parts.append("1" if v else "0")
+        elif isinstance(v, (numbers.Real, decimal.Decimal, uuid.UUID)):
+            parts.append(str(v))
+        elif isinstance(v, (list, tuple)):
+            parts.append(_array_literal(v))
+        else:
+            raise TypeError(
+                f"unsupported array element of type {type(v).__name__!r}: {v!r}"
+            )
+    return "{" + ",".join(parts) + "}"
+
+
+class _UnnestUpsert(NamedTuple):
+    """An upsert statement taking one array parameter per column."""
+
+    sql: str
+    # Indexes of the columns whose values are passed as array literals.
+    literal_columns: tuple[int, ...]
+
+
+class _RowHandler(coco.TargetHandler[_RowValue, _RowFingerprint]):
+    """Handler for row-level target states within a table."""
+
+    tracks_value_fingerprint = True
+
+    _pool: asyncpg.Pool
+    _table_name: str
+    _schema_name: str | None
+    _table_schema: TableSchema
+    _sink: coco.TargetActionSink[_RowAction]
+    _col_names: list[str]
+    _col_list: str
+    _insert_into: str  # `INSERT INTO <table> (<columns>)`
+    _conflict_clause: str
+    # Resolved from the table's column types on the first upsert; None once
+    # resolved means the table is upserted through multi-row VALUES.
+    _unnest_upsert: _UnnestUpsert | None
+    _unnest_upsert_resolved: bool
+
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        table_name: str,
+        pg_schema_name: str | None,
+        table_schema: TableSchema,
+    ) -> None:
+        self._pool = pool
+        self._table_name = table_name
+        self._schema_name = pg_schema_name
+        self._table_schema = table_schema
+        self._sink = coco.TargetActionSink.from_async_fn(self._apply_actions)
+
+        pk_cols = table_schema.primary_key
+        self._col_names = list(table_schema.columns.keys())
+        self._col_list = ", ".join(f'"{c}"' for c in self._col_names)
+        pk_list = ", ".join(f'"{c}"' for c in pk_cols)
+        self._insert_into = (
+            f"INSERT INTO {_qualified_table_name(table_name, pg_schema_name)} "
+            f"({self._col_list})"
+        )
+        non_pk_cols = [c for c in self._col_names if c not in pk_cols]
+        if non_pk_cols:
+            update_list = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in non_pk_cols)
+            self._conflict_clause = (
+                f"ON CONFLICT ({pk_list}) DO UPDATE SET {update_list}"
+            )
+        else:
+            self._conflict_clause = f"ON CONFLICT ({pk_list}) DO NOTHING"
+        self._unnest_upsert = None
+        self._unnest_upsert_resolved = False
+
+    async def _apply_actions(
+        self, context_provider: ContextProvider, actions: Sequence[_RowAction]
+    ) -> None:
+        """Apply row actions (upserts and deletes) to the database."""
+
+        if not actions:
+            return
+
+        upserts: list[_RowValue] = []
+        deletes: list[_RowAction] = []
+
+        for action in actions:
+            if action.value is None:
+                deletes.append(action)
+            else:
+                upserts.append(action.value)
+
+        if upserts and not self._unnest_upsert_resolved:
+            self._unnest_upsert = await self._resolve_unnest_upsert()
+            self._unnest_upsert_resolved = True
+
+        async with asyncio.TaskGroup() as tg:
+            self._schedule_upserts(tg, upserts)
+            self._schedule_deletes(tg, deletes)
+
+    async def _resolve_unnest_upsert(self) -> _UnnestUpsert | None:
+        """Build the `unnest` upsert statement, if every column's type allows it.
+
+        `INSERT ... SELECT ... FROM unnest(<one array per column>)` costs about
+        half of the multi-row VALUES statement for large batches: its text and
+        parameter count don't grow with the row count. The array types come from
+        the table itself, like the parameter types Postgres infers for VALUES, so
+        both statements accept the same Python values.
+
+        Returns None for a table with any other column type (e.g. pgvector's,
+        where parsing the vectors dominates either statement).
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                _COLUMN_TYPES_SQL,
+                _qualified_table_name(self._table_name, self._schema_name),
+            )
+        types = {
+            row["name"]: (row["type_name"], row["is_array"])
+            for row in rows
+            if row["type_schema"] == "pg_catalog"
+        }
+        params: list[str] = []
+        exprs: list[str] = []
+        literal_columns: list[int] = []
+        for i, col_name in enumerate(self._col_names):
+            type_name, is_array = types.get(col_name, (None, False))
+            if is_array and type_name in _UNNEST_ARRAY_ELEMENT_TYPES:
+                params.append(f"${i + 1}::pg_catalog.text[]")
+                exprs.append(f'r."{col_name}"::pg_catalog."{type_name}"[]')
+                literal_columns.append(i)
+            elif not is_array and type_name in _UNNEST_SCALAR_TYPES:
+                params.append(f'${i + 1}::pg_catalog."{type_name}"[]')
+                exprs.append(f'r."{col_name}"')
+            else:
+                return None
+        return _UnnestUpsert(
+            sql=(
+                f"{self._insert_into} SELECT {', '.join(exprs)} "
+                f"FROM unnest({', '.join(params)}) AS r({self._col_list}) "
+                f"{self._conflict_clause}"
+            ),
+            literal_columns=tuple(literal_columns),
+        )
+
+    def _schedule_upserts(
+        self,
+        tg: asyncio.TaskGroup,
+        upserts: list[_RowValue],
+    ) -> None:
+        """Schedule upsert chunks as parallel tasks."""
+        if not upserts or not self._col_names:
+            return
+
+        unnest = self._unnest_upsert
+        chunk_size = (
+            _UNNEST_UPSERT_ROWS
+            if unnest is not None
+            else max(1, _BIND_LIMIT // len(self._col_names))
+        )
+        for i in range(0, len(upserts), chunk_size):
+            chunk = upserts[i : i + chunk_size]
+            tg.create_task(
+                self._execute_values_upsert_chunk(chunk)
+                if unnest is None
+                else self._execute_unnest_upsert_chunk(unnest, chunk)
+            )
+
+    async def _execute_values_upsert_chunk(self, chunk: list[_RowValue]) -> None:
+        """Upsert a chunk of rows through one multi-row VALUES statement."""
+        num_parameters = len(self._col_names)
+        values_sql_parts: list[str] = []
+        params: list[Any] = []
+        for row_idx, row in enumerate(chunk):
+            base = row_idx * num_parameters
+            placeholders = ", ".join(f"${base + j + 1}" for j in range(num_parameters))
+            values_sql_parts.append(f"({placeholders})")
+            params.extend(row.get(col_name) for col_name in self._col_names)
+
+        values_sql = ", ".join(values_sql_parts)
+        sql = f"{self._insert_into} VALUES {values_sql} {self._conflict_clause}"
+        async with self._pool.acquire() as conn:
+            await conn.execute(sql, *params)
+
+    async def _execute_unnest_upsert_chunk(
+        self, unnest: _UnnestUpsert, chunk: list[_RowValue]
+    ) -> None:
+        """Upsert a chunk of rows through the `unnest` statement."""
+        columns: list[list[Any]] = [
+            [row.get(col_name) for row in chunk] for col_name in self._col_names
+        ]
+        for i in unnest.literal_columns:
+            columns[i] = [None if v is None else _array_literal(v) for v in columns[i]]
+        async with self._pool.acquire() as conn:
+            await conn.execute(unnest.sql, *columns)
+
+    def _schedule_deletes(
+        self,
+        tg: asyncio.TaskGroup,
+        deletes: list[_RowAction],
+    ) -> None:
+        """Schedule delete chunks as parallel tasks."""
+        if not deletes:
+            return
+
+        table_name = _qualified_table_name(self._table_name, self._schema_name)
+        pk_cols = self._table_schema.primary_key
+        num_pk = len(pk_cols)
+
+        chunk_size = max(1, _BIND_LIMIT // num_pk)
+        for i in range(0, len(deletes), chunk_size):
+            chunk = deletes[i : i + chunk_size]
+            tg.create_task(
+                self._execute_delete_chunk(table_name, pk_cols, num_pk, chunk)
+            )
+
+    async def _execute_delete_chunk(
+        self,
+        table_name: str,
+        pk_cols: list[str],
+        num_pk: int,
+        chunk: list[_RowAction],
+    ) -> None:
+        """Execute a single batched delete chunk."""
+        params: list[Any] = []
+        if num_pk == 1:
+            placeholders = ", ".join(f"${i + 1}" for i in range(len(chunk)))
+            sql = f'DELETE FROM {table_name} WHERE "{pk_cols[0]}" IN ({placeholders})'
+            params.extend(action.key[0] for action in chunk)
+        else:
+            # Not an OR chain of per-key equalities: Postgres plans that as a
+            # BitmapOr whose planning time grows quadratically with the number of
+            # keys (tens of seconds for a full chunk), while `IN (VALUES ...)`
+            # plans as one join against the key list. VALUES columns don't take
+            # their types from the compared columns, so each placeholder is cast
+            # to the declared column type.
+            columns = self._table_schema.columns
+            pk_types = [columns[c].type for c in pk_cols]
+            value_rows: list[str] = []
+            for row_idx, action in enumerate(chunk):
+                base = row_idx * num_pk
+                placeholders = ", ".join(
+                    f"${base + j + 1}::{pk_types[j]}" for j in range(num_pk)
+                )
+                value_rows.append(f"({placeholders})")
+                params.extend(action.key)
+            pk_list = ", ".join(f'"{c}"' for c in pk_cols)
+            sql = (
+                f"DELETE FROM {table_name} "
+                f"WHERE ({pk_list}) IN (VALUES {', '.join(value_rows)})"
+            )
+
+        async with self._pool.acquire() as conn:
+            await conn.execute(sql, *params)
+
+    def attachments(
+        self,
+    ) -> dict[str, _VectorIndexHandler | _SqlCommandHandler]:
+        return {
+            "vector_index": _VectorIndexHandler(
+                self._pool, self._table_name, self._schema_name
+            ),
+            "sql_command_attachment": _SqlCommandHandler(
+                self._pool, self._table_name, self._schema_name
+            ),
+        }
+
+    def reconcile(
+        self,
+        key: coco.StableKey,
+        desired_state: _RowValue | coco.NonExistenceType,
+        prev_possible_records: Collection[_RowFingerprint],
+        prev_may_be_missing: bool,
+        /,
+    ) -> coco.TargetReconcileOutput[_RowAction, _RowFingerprint] | None:
+        key = _ROW_KEY_CHECKER.check(key)
+        if coco.is_non_existence(desired_state):
+            # Delete case - only if it might exist
+            if not prev_possible_records and not prev_may_be_missing:
+                return None
+            return coco.TargetReconcileOutput(
+                action=_RowAction(key=key, value=None),
+                sink=self._sink,
+                tracking_record=coco.NON_EXISTENCE,
+            )
+
+        # Upsert case
+        target_fp = fingerprint_object(desired_state)
+        if not prev_may_be_missing and all(
+            prev == target_fp for prev in prev_possible_records
+        ):
+            # No change needed
+            return None
+
+        return coco.TargetReconcileOutput(
+            action=_RowAction(key=key, value=desired_state),
+            sink=self._sink,
+            tracking_record=target_fp,
+        )
+
+
+class _TableKey(NamedTuple):
+    """Key identifying a table: (database_key, pg_schema_name, table_name)."""
+
+    db_key: str  # Stable key for the database
+    pg_schema_name: str | None
+    table_name: str
+
+
+_TABLE_KEY_CHECKER = TypeChecker(tuple[str, str | None, str])
+
+
+@dataclass
+class _TableSpec:
+    """Specification for a PostgreSQL table."""
+
+    table_schema: TableSchema[Any]
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM
+
+
+class _PkColumnTrackingRecord(msgspec.Struct, frozen=True, array_like=True):
+    """Primary-key column signature used for table-level main tracking record."""
+
+    name: str
+    type: str
+
+
+class _NonPkColumnTrackingRecord(msgspec.Struct, frozen=True, array_like=True):
+    """Per-non-PK column tracking record used for incremental ALTER TABLE operations."""
+
+    type: str
+    nullable: bool
+
+
+_EXT_PGVECTOR_SUBKEY: str = "ext:pgvector"
+_COL_SUBKEY_PREFIX: str = "col:"
+
+
+def _schema_uses_pgvector(schema: TableSchema[Any]) -> bool:
+    return any(_is_pgvector_pg_type(c.type) for c in schema.columns.values())
+
+
+def _col_subkey(col_name: str) -> str:
+    return f"{_COL_SUBKEY_PREFIX}{col_name}"
+
+
+_TableSubTrackingRecord = _NonPkColumnTrackingRecord | None
+
+
+def _table_composite_tracking_record_from_spec(
+    spec: _TableSpec,
+) -> statediff.CompositeTrackingRecord[
+    tuple[_PkColumnTrackingRecord, ...], str, _TableSubTrackingRecord
+]:
+    schema = spec.table_schema
+    col_by_name = schema.columns
+    pk_sig = tuple(
+        _PkColumnTrackingRecord(name=pk, type=col_by_name[pk].type)
+        for pk in schema.primary_key
+    )
+    sub: dict[str, _TableSubTrackingRecord] = {
+        _col_subkey(col_name): _NonPkColumnTrackingRecord(
+            type=col_def.type, nullable=col_def.nullable
+        )
+        for col_name, col_def in schema.columns.items()
+        if col_name not in schema.primary_key
+    }
+    if _schema_uses_pgvector(schema):
+        sub[_EXT_PGVECTOR_SUBKEY] = None
+    return statediff.CompositeTrackingRecord(main=pk_sig, sub=sub)
+
+
+_TableTrackingRecord = statediff.MutualTrackingRecord[
+    statediff.CompositeTrackingRecord[
+        tuple[_PkColumnTrackingRecord, ...], str, _TableSubTrackingRecord
+    ]
+]
+
+
+class _TableAction(NamedTuple):
+    """Action to perform on a table."""
+
+    key: _TableKey
+    spec: _TableSpec | coco.NonExistenceType
+    main_action: statediff.DiffAction | None
+    column_actions: dict[str, statediff.DiffAction]
+
+
+class _TableHandler(coco.TargetHandler[_TableSpec, _TableTrackingRecord, _RowHandler]):
+    """Handler for table-level target states."""
+
+    _sink: coco.TargetActionSink[_TableAction]
+
+    def __init__(self) -> None:
+        self._sink = coco.TargetActionSink.from_async_fn(
+            self._apply_actions, child_handler=self._row_handler
+        )
+
+    @staticmethod
+    def _row_handler(
+        context_provider: ContextProvider, action: _TableAction, /
+    ) -> _RowHandler:
+        """The row handler for a created or updated table's rows."""
+        key = action.key
+        assert not coco.is_non_existence(action.spec)
+        return _RowHandler(
+            pool=context_provider.get(key.db_key, asyncpg.Pool),
+            table_name=key.table_name,
+            pg_schema_name=key.pg_schema_name,
+            table_schema=action.spec.table_schema,
+        )
+
+    async def _apply_actions(
+        self,
+        context_provider: ContextProvider,
+        actions: Sequence[_TableAction],
+        /,
+    ) -> None:
+        """Apply table actions (DDL)."""
+        # Group actions by table key so we can apply all DDL for the same table
+        # within a single transaction/connection.
+        by_key: dict[_TableKey, list[_TableAction]] = {}
+        for action in actions:
+            by_key.setdefault(action.key, []).append(action)
+
+        for key, key_actions in by_key.items():
+            pool = context_provider.get(key.db_key, asyncpg.Pool)
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    for action in key_actions:
+                        if action.main_action in ("replace", "delete"):
+                            await self._drop_table(
+                                conn, key.table_name, key.pg_schema_name
+                            )
+
+                        if coco.is_non_existence(action.spec):
+                            continue
+
+                        spec = action.spec
+                        if action.main_action in ("insert", "upsert", "replace"):
+                            await self._create_table(
+                                conn,
+                                key,
+                                spec.table_schema,
+                                if_not_exists=(action.main_action == "upsert"),
+                            )
+                            # "insert" / "replace" just built the table from the
+                            # desired schema, so its columns already match.
+                            # "upsert" may have found a pre-existing table with an
+                            # older column set — fall through and reconcile it.
+                            if action.main_action != "upsert":
+                                continue
+
+                        # Reconcile non-PK columns incrementally.
+                        if action.column_actions:
+                            await self._apply_column_actions(
+                                conn, key, spec.table_schema, action.column_actions
+                            )
+
+    async def _drop_table(
+        self,
+        conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record],
+        table_name: str,
+        pg_schema_name: str | None,
+    ) -> None:
+        """Drop a table if it exists."""
+        qualified_name = _qualified_table_name(table_name, pg_schema_name)
+        await conn.execute(f"DROP TABLE IF EXISTS {qualified_name}")
+
+    async def _ensure_pgvector_extension(
+        self,
+        conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record],
+    ) -> None:
+        """
+        Ensure the pgvector extension is installed.
+
+        The extension is installed into its default schema (typically `public`),
+        which is on the default `search_path`. We deliberately do not tie the
+        extension's location to the target table's schema: extensions are a
+        database-wide resource, and pinning `vector` to a per-app schema would
+        leave the unqualified `vector(N)` references in DDL unresolved.
+        """
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+    async def _create_table(
+        self,
+        conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record],
+        key: _TableKey,
+        schema: TableSchema[Any],
+        *,
+        if_not_exists: bool,
+    ) -> None:
+        """Create a table."""
+        qualified_name = _qualified_table_name(key.table_name, key.pg_schema_name)
+
+        # Create schema if specified
+        if key.pg_schema_name:
+            await conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{key.pg_schema_name}"')
+
+        # Ensure pgvector extension exists if needed by any column type.
+        if _schema_uses_pgvector(schema):
+            await self._ensure_pgvector_extension(conn)
+
+        # Build column definitions
+        col_defs = []
+        for col_name, col in schema.columns.items():
+            nullable = (
+                ""
+                if col.nullable and col_name not in schema.primary_key
+                else " NOT NULL"
+            )
+            col_defs.append(f'"{col_name}" {col.type}{nullable}')
+
+        # Build primary key constraint
+        pk_cols = ", ".join(f'"{c}"' for c in schema.primary_key)
+        col_defs.append(f"PRIMARY KEY ({pk_cols})")
+
+        columns_sql = ", ".join(col_defs)
+        if_not_exists_sql = " IF NOT EXISTS" if if_not_exists else ""
+        sql = f"CREATE TABLE{if_not_exists_sql} {qualified_name} ({columns_sql})"
+        await conn.execute(sql)
+
+    async def _apply_column_actions(
+        self,
+        conn: asyncpg.pool.PoolConnectionProxy[asyncpg.Record],
+        key: _TableKey,
+        schema: TableSchema[Any],
+        column_actions: dict[str, statediff.DiffAction],
+    ) -> None:
+        qualified_name = _qualified_table_name(key.table_name, key.pg_schema_name)
+        pk_cols = set(schema.primary_key)
+        non_pk_col_by_name = {
+            n: c for n, c in schema.columns.items() if n not in pk_cols
+        }
+        for sub_key, action in column_actions.items():
+            if sub_key == _EXT_PGVECTOR_SUBKEY:
+                if action != "delete":
+                    await self._ensure_pgvector_extension(conn)
+                continue
+
+            if not sub_key.startswith(_COL_SUBKEY_PREFIX):
+                raise ValueError(
+                    f"Unexpected column subkey format: {sub_key!r}, expected to start with {_COL_SUBKEY_PREFIX!r}"
+                )
+            col_name = sub_key[len(_COL_SUBKEY_PREFIX) :]
+
+            # Defensive: we never ALTER PK columns here.
+            if col_name in pk_cols:
+                continue
+
+            if action == "delete":
+                await conn.execute(
+                    f'ALTER TABLE {qualified_name} DROP COLUMN IF EXISTS "{col_name}"'
+                )
+                continue
+
+            desired_col = non_pk_col_by_name.get(col_name)
+            if desired_col is None:
+                # If the desired schema no longer mentions this column, treat
+                # it as a no-op here; "delete" should have been emitted.
+                continue
+
+            if action == "insert":
+                async with conn.transaction():
+                    await conn.execute(
+                        f"ALTER TABLE {qualified_name} "
+                        f'ADD COLUMN "{col_name}" {desired_col.type}'
+                    )
+                continue
+
+            if action == "upsert":
+                await conn.execute(
+                    f"ALTER TABLE {qualified_name} "
+                    f'ADD COLUMN IF NOT EXISTS "{col_name}" {desired_col.type}'
+                )
+                continue
+
+            if action == "replace":
+                # Type change may fail depending on existing data. Try ALTER TYPE first
+                # inside a savepoint; if it fails, fall back to drop+add.
+                try:
+                    async with conn.transaction():
+                        set_null = (
+                            "DROP NOT NULL" if desired_col.nullable else "SET NOT NULL"
+                        )
+                        await conn.execute(
+                            f"ALTER TABLE {qualified_name} "
+                            f'ALTER COLUMN "{col_name}" TYPE {desired_col.type}, '
+                            f'ALTER COLUMN "{col_name}" {set_null}'
+                        )
+                except asyncpg.PostgresError:
+                    logger.warning(
+                        f"PostgreSQL type conversion for column {col_name!r} failed. "
+                        f"Recreating column. Existing data will be lost."
+                    )
+
+                    await conn.execute(
+                        f'ALTER TABLE {qualified_name} DROP COLUMN IF EXISTS "{col_name}"'
+                    )
+                    await conn.execute(
+                        f"ALTER TABLE {qualified_name} "
+                        f'ADD COLUMN "{col_name}" {desired_col.type}'
+                    )
+
+    def reconcile(
+        self,
+        key: coco.StableKey,
+        desired_state: _TableSpec | coco.NonExistenceType,
+        prev_possible_records: Collection[_TableTrackingRecord],
+        prev_may_be_missing: bool,
+        /,
+    ) -> (
+        coco.TargetReconcileOutput[_TableAction, _TableTrackingRecord, _RowHandler]
+        | None
+    ):
+        key = _TableKey(*_TABLE_KEY_CHECKER.check(key))
+
+        tracking_record: _TableTrackingRecord | coco.NonExistenceType
+
+        if coco.is_non_existence(desired_state):
+            tracking_record = coco.NON_EXISTENCE
+        else:
+            tracking_record = statediff.MutualTrackingRecord(
+                tracking_record=_table_composite_tracking_record_from_spec(
+                    desired_state
+                ),
+                managed_by=desired_state.managed_by,
+            )
+
+        resolved = statediff.resolve_system_transition(
+            statediff.TrackingRecordTransition(
+                tracking_record,
+                prev_possible_records,
+                prev_may_be_missing,
+            )
+        )
+        main_action, column_transitions = statediff.diff_composite(resolved)
+
+        # "upsert" means the table may or may not already exist: `CREATE TABLE IF
+        # NOT EXISTS` can land on a table carrying the previous column set, so its
+        # columns still need reconciling. "insert" / "replace" build the table from
+        # the desired schema, so there is nothing left to reconcile.
+        column_actions: dict[str, statediff.DiffAction] = {}
+        if main_action is None or main_action == "upsert":
+            for sub_key, t in column_transitions.items():
+                action = statediff.diff(t)
+                if action is not None:
+                    column_actions[sub_key] = action
+
+        # Determine child invalidation for row-level targets.
+        child_invalidation: Literal["destructive", "lossy"] | None = None
+        if main_action == "replace":
+            # Table is dropped and recreated — all rows are destroyed.
+            child_invalidation = "destructive"
+        elif any(a != "insert" for a in column_actions.values()):
+            # Column schema changes (other than adding new columns) may lose data.
+            child_invalidation = "lossy"
+
+        return coco.TargetReconcileOutput(
+            action=_TableAction(
+                key=key,
+                spec=desired_state,
+                main_action=main_action,
+                column_actions=column_actions,
+            ),
+            sink=self._sink,
+            tracking_record=tracking_record,
+            child_invalidation=child_invalidation,
+        )
+
+
+# Register the root target states provider
+_table_provider = coco.register_root_target_states_provider(
+    "cocoindex/postgres/table", _TableHandler()
+)
+
+
+_TABLE_TARGET_DEPRECATION = (
+    "TableTarget(provider, table_schema) is deprecated and skips the vector index "
+    "name check; pass the table name: TableTarget(provider, table_name, table_schema)."
+)
+
+
+class TableTarget(
+    Generic[RowT, coco.MaybePendingS], coco.ResolvesTo["TableTarget[RowT]"]
+):
+    """
+    A target for writing rows to a PostgreSQL table.
+
+    The table is managed as a target state, with the scope used to scope the target state.
+
+    Type Parameters:
+        RowT: The type of row objects (dict, dataclass, NamedTuple, or Pydantic model).
+    """
+
+    _provider: coco.TargetStateProvider[_RowValue, None, coco.MaybePendingS]
+    # None only for the deprecated two-argument form, which skips the vector
+    # index name check.
+    _table_name: str | None
+    _table_schema: TableSchema[RowT]
+    # Vector index name by the (truncated) PostgreSQL index name it maps to.
+    _vector_index_names: dict[str, str]
+
+    @overload
+    def __init__(
+        self,
+        provider: coco.TargetStateProvider[_RowValue, None, coco.MaybePendingS],
+        table_name: str,
+        table_schema: TableSchema[RowT],
+    ) -> None: ...
+
+    @overload
+    @deprecated(_TABLE_TARGET_DEPRECATION)
+    def __init__(
+        self,
+        provider: coco.TargetStateProvider[_RowValue, None, coco.MaybePendingS],
+        table_schema: TableSchema[RowT],
+        /,
+    ) -> None: ...
+
+    @overload
+    @deprecated(_TABLE_TARGET_DEPRECATION)
+    def __init__(
+        self,
+        provider: coco.TargetStateProvider[_RowValue, None, coco.MaybePendingS],
+        *,
+        table_schema: TableSchema[RowT],
+    ) -> None: ...
+
+    def __init__(
+        self,
+        provider: coco.TargetStateProvider[_RowValue, None, coco.MaybePendingS],
+        table_name: str | TableSchema[RowT] | None = None,
+        table_schema: TableSchema[RowT] | None = None,
+    ) -> None:
+        if isinstance(table_name, TableSchema):
+            # The deprecated form TableTarget(provider, table_schema).
+            if table_schema is not None:
+                raise TypeError(
+                    "TableTarget() takes table_name before table_schema, not two schemas"
+                )
+            table_name, table_schema = None, table_name
+        if table_schema is None:
+            raise TypeError("TableTarget() missing required argument: 'table_schema'")
+        if table_name is None:
+            warnings.warn(_TABLE_TARGET_DEPRECATION, DeprecationWarning, stacklevel=2)
+        self._provider = provider
+        self._table_name = table_name
+        self._table_schema = table_schema
+        self._vector_index_names = {}
+
+    def declare_row(self: "TableTarget[RowT]", *, row: RowT) -> None:
+        """
+        Declare a row to be upserted to this table.
+
+        Args:
+            row: A row object (dict, dataclass, NamedTuple, or Pydantic model).
+                 Must include all primary key columns.
+        """
+        row_dict = self._row_to_dict(row)
+        # Extract primary key values
+        pk_values = tuple(row_dict[pk] for pk in self._table_schema.primary_key)
+        coco.declare_target_state(self._provider.target_state(pk_values, row_dict))
+
+    def _row_to_dict(self, row: RowT) -> dict[str, Any]:
+        """
+        Convert a row (dict or object) into dict[str, Any] using the schema columns,
+        and apply column encoders for both dict and object inputs.
+        """
+        out: dict[str, Any] = {}
+        for col_name, col in self._table_schema.columns.items():
+            if isinstance(row, dict):
+                value = row.get(col_name)
+            else:
+                value = getattr(row, col_name)
+
+            if value is not None and col.encoder is not None:
+                value = col.encoder(value)
+            # Strip NUL from values bound to Postgres recursively. jsonb columns
+            # are already handled inside `_json_encoder`, so the recursive walk
+            # is a harmless no-op on the encoded JSON string.
+            value = _sanitize_nul(value)
+            out[col_name] = value
+        return out
+
+    def declare_vector_index(
+        self: "TableTarget[RowT]",
+        *,
+        name: str | None = None,
+        column: str,
+        metric: Literal["cosine", "l2", "ip"] = "cosine",
+        method: Literal["ivfflat", "hnsw"] = "ivfflat",
+        lists: int | None = None,
+        m: int | None = None,
+        ef_construction: int | None = None,
+    ) -> None:
+        """
+        Declare a pgvector index on a column of this table.
+
+        The actual Postgres index will be named ``{table_name}__vector__{name}``.
+        PostgreSQL truncates a name longer than 63 bytes. Declaring two vector
+        indexes on this target whose names become the same after truncation
+        raises a ``ValueError``.
+
+        Args:
+            name: Logical index name (defaults to ``column``).
+            column: Column to index.
+            metric: Distance metric ("cosine", "l2", or "ip").
+            method: Index method ("ivfflat" or "hnsw").
+            lists: Number of lists (ivfflat only).
+            m: Maximum number of connections per layer (hnsw only).
+            ef_construction: Size of the dynamic candidate list (hnsw only).
+        """
+        if name is None:
+            name = column
+        col_def = self._table_schema.columns.get(column)
+        if col_def is None:
+            raise ValueError(
+                f"Column '{column}' not found in table schema: {list(self._table_schema.columns.keys())}"
+            )
+        self._check_vector_index_name(name)
+        spec = _VectorIndexSpec(
+            column=column,
+            metric=metric,
+            op_class=_pgvector_op_class(column, col_def.type, metric),
+            method=method,
+            lists=lists,
+            m=m,
+            ef_construction=ef_construction,
+        )
+        att_provider = self._provider.attachment("vector_index")
+        coco.declare_target_state(att_provider.target_state(name, spec))
+
+    def _check_vector_index_name(self, name: str) -> None:
+        """Raise if another vector index on this table gets the same PostgreSQL name."""
+        if self._table_name is None:
+            return
+        pg_name = _truncated_identifier(_vector_index_name(self._table_name, name))
+        other = self._vector_index_names.setdefault(pg_name, name)
+        if other == name:
+            return
+        prefix_bytes = len(_vector_index_name(self._table_name, "").encode())
+        if prefix_bytes >= _MAX_IDENTIFIER_BYTES:
+            hint = "Use a shorter table name to have more than one vector index."
+        else:
+            hint = (
+                "Use vector index names that differ within their first "
+                f"{_MAX_IDENTIFIER_BYTES - prefix_bytes} bytes, or a shorter table name."
+            )
+        raise ValueError(
+            f"Vector indexes {other!r} and {name!r} on table {self._table_name!r} "
+            f"both get the PostgreSQL index name {pg_name!r}: PostgreSQL truncates "
+            f"names to {_MAX_IDENTIFIER_BYTES} bytes. {hint}"
+        )
+
+    def declare_sql_command_attachment(
+        self: "TableTarget[RowT]",
+        *,
+        name: str,
+        setup_sql: str,
+        teardown_sql: str | None = None,
+    ) -> None:
+        """
+        Declare a SQL command attachment on this table.
+
+        The setup SQL is executed when the attachment is created or changed.
+        The teardown SQL (if provided) is executed when the attachment is removed
+        or before re-running setup on change.
+
+        Args:
+            name: Attachment name (stable identifier).
+            setup_sql: SQL to execute on creation/change.
+            teardown_sql: SQL to execute on removal/before change (optional).
+        """
+        spec = _SqlCommandSpec(
+            setup_sql=setup_sql,
+            teardown_sql=teardown_sql,
+        )
+        att_provider = self._provider.attachment("sql_command_attachment")
+        coco.declare_target_state(att_provider.target_state(name, spec))
+
+    def __coco_memo_key__(self) -> str:
+        return self._provider.memo_key
+
+
+def table_target(
+    db: ContextKey[asyncpg.Pool],
+    table_name: str,
+    table_schema: TableSchema[RowT],
+    *,
+    pg_schema_name: str | None = None,
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM,
+) -> coco.TargetState[_RowHandler]:
+    """
+    Create a TargetState for a PostgreSQL table target.
+
+    Use with ``coco.mount_target()`` to mount and get a child provider,
+    or with ``mount_table_target()`` for a convenience wrapper.
+
+    Args:
+        db: ContextKey for the asyncpg.Pool connection.
+        table_name: Name of the table.
+        table_schema: Schema definition including columns and primary key.
+        pg_schema_name: Optional PostgreSQL schema name. When None, the table
+            name is not schema-qualified, so `search_path` picks the schema.
+        managed_by: Whether the table is managed by "system" or "user".
+
+    Returns:
+        A TargetState that can be passed to ``mount_target()``.
+    """
+    _validate_identifier(table_name, "table name")
+    if pg_schema_name is not None:
+        _validate_identifier(pg_schema_name, "schema name")
+    for col_name in table_schema.columns:
+        _validate_identifier(col_name, "column name")
+
+    key = _TableKey(
+        db_key=db.key,
+        pg_schema_name=pg_schema_name,
+        table_name=table_name,
+    )
+    spec = _TableSpec(
+        table_schema=table_schema,
+        managed_by=managed_by,
+    )
+    return _table_provider.target_state(key, spec)
+
+
+def declare_table_target(
+    db: ContextKey[asyncpg.Pool],
+    table_name: str,
+    table_schema: TableSchema[RowT],
+    *,
+    pg_schema_name: str | None = None,
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM,
+) -> TableTarget[RowT, coco.PendingS]:
+    """
+    Create a TableTarget for writing rows to a PostgreSQL table.
+
+    Args:
+        db: ContextKey for the asyncpg.Pool connection.
+        table_name: Name of the table.
+        table_schema: Schema definition including columns and primary key.
+        pg_schema_name: Optional PostgreSQL schema name. When None, the table
+            name is not schema-qualified, so `search_path` picks the schema.
+        managed_by: Whether the table is managed by "system" (CocoIndex creates/drops it)
+                    or "user" (table must exist, CocoIndex only manages rows).
+
+    Returns:
+        A TableTarget that can be used to declare rows.
+    """
+    provider = coco.declare_target_state_with_child(
+        table_target(
+            db,
+            table_name,
+            table_schema,
+            pg_schema_name=pg_schema_name,
+            managed_by=managed_by,
+        )
+    )
+    return TableTarget(provider, table_name, table_schema)
+
+
+async def mount_table_target(
+    db: ContextKey[asyncpg.Pool],
+    table_name: str,
+    table_schema: TableSchema[RowT],
+    *,
+    pg_schema_name: str | None = None,
+    managed_by: target.ManagedBy = target.ManagedBy.SYSTEM,
+) -> TableTarget[RowT]:
+    """
+    Mount a table target and return a ready-to-use TableTarget.
+
+    Sugar over ``table_target()`` + ``coco.mount_target()`` + wrapping.
+
+    Args:
+        db: ContextKey for the asyncpg.Pool connection.
+        table_name: Name of the table.
+        table_schema: Schema definition including columns and primary key.
+        pg_schema_name: Optional PostgreSQL schema name. When None, the table
+            name is not schema-qualified, so `search_path` picks the schema.
+        managed_by: Whether the table is managed by "system" or "user".
+
+    Returns:
+        A TableTarget that can be used to declare rows.
+    """
+    provider = await coco.mount_target(
+        table_target(
+            db,
+            table_name,
+            table_schema,
+            pg_schema_name=pg_schema_name,
+            managed_by=managed_by,
+        )
+    )
+    return TableTarget(provider, table_name, table_schema)
+
+
+async def create_pool(
+    dsn: str | None = None,
+    **kwargs: Any,
+) -> asyncpg.Pool:
+    """Deprecated: use ``asyncpg.create_pool()`` directly.
+
+    Kept for backward compatibility.
+    """
+    return await asyncpg.create_pool(dsn, **kwargs)
+
+
+__all__ = [
+    "ColumnDef",
+    "ValueEncoder",
+    "PgType",
+    "TableSchema",
+    "TableTarget",
+    "create_pool",
+    "declare_table_target",
+    "mount_table_target",
+    "table_target",
+]

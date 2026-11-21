@@ -1,0 +1,1553 @@
+#![cfg(feature = "postgres")]
+
+use std::str::FromStr as _;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use cocoindex::connectors::postgres;
+use cocoindex::{App, Ctx, Environment, PreviewAction, Result, SchemaFields};
+use futures::TryStreamExt as _;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use sqlx::Row as _;
+
+cocoindex::context_key!(
+    static PG: postgres::Database, key = "postgres_target_test_db"
+);
+
+mod common;
+
+/// Build an app over a fresh state directory. Installs the SQL statement log
+/// first: it has to be in place before the engine initializes its own tracing.
+async fn build_app(db: &postgres::Database, name: &str) -> Result<(App, tempfile::TempDir)> {
+    common::record_sql_statements();
+    let tempdir = tempfile::tempdir().unwrap();
+    let app = Environment::builder()
+        .db_path(tempdir.path().join(".cocoindex_db"))
+        .provide_key(&PG, db.clone())
+        .build()
+        .await?
+        .app(name)
+        .await?;
+    Ok((app, tempdir))
+}
+
+#[derive(Clone, Serialize)]
+struct TestRow {
+    id: i64,
+    label: String,
+}
+
+#[derive(Clone, Serialize)]
+struct EmbeddingRow {
+    id: i64,
+    embedding: Vec<f32>,
+}
+
+async fn declare_rows(ctx: Ctx, schema: String, rows: Vec<TestRow>) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "rows",
+        postgres::TableSchema::new(
+            [
+                ("id", postgres::ColumnDef::new("bigint")),
+                ("label", postgres::ColumnDef::new("text")),
+            ],
+            ["id"],
+        )?,
+        Some(&schema),
+    )
+    .await?;
+    for row in &rows {
+        table.declare_row(&ctx, row)?;
+    }
+    Ok(())
+}
+
+async fn declare_vector_table(ctx: Ctx, schema: String, with_index: bool) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "vectors",
+        postgres::TableSchema::new(
+            [
+                ("id", postgres::ColumnDef::new("bigint")),
+                ("embedding", postgres::ColumnDef::new("vector(3)")),
+            ],
+            ["id"],
+        )?,
+        Some(&schema),
+    )
+    .await?;
+    if with_index {
+        table.declare_vector_index(
+            &ctx,
+            "embedding",
+            postgres::VectorIndexOptions {
+                name: Some("embedding_idx".to_string()),
+                ..Default::default()
+            },
+        )?;
+    }
+    table.declare_row(
+        &ctx,
+        &EmbeddingRow {
+            id: 1,
+            embedding: vec![0.0, 1.0, 0.0],
+        },
+    )?;
+    Ok(())
+}
+
+async fn declare_rows_with_sql_command(
+    ctx: Ctx,
+    schema: String,
+    with_attachment: bool,
+) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "rows",
+        postgres::TableSchema::new(
+            [
+                ("id", postgres::ColumnDef::new("bigint")),
+                ("label", postgres::ColumnDef::new("text")),
+            ],
+            ["id"],
+        )?,
+        Some(&schema),
+    )
+    .await?;
+    if with_attachment {
+        table.declare_sql_command_attachment(
+            &ctx,
+            "label_index",
+            format!("CREATE INDEX IF NOT EXISTS rows_label_idx ON \"{schema}\".\"rows\" (label)"),
+            Some(format!("DROP INDEX IF EXISTS \"{schema}\".rows_label_idx")),
+        )?;
+    }
+    table.declare_row(
+        &ctx,
+        &TestRow {
+            id: 1,
+            label: "one".to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+async fn relation_exists(
+    db: &postgres::Database,
+    schema: &str,
+    name: &str,
+    relkind: &str,
+) -> Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = $3
+        )",
+    )
+    .bind(schema)
+    .bind(name)
+    .bind(relkind)
+    .fetch_one(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres relation lookup: {e}")))
+}
+
+async fn table_exists(db: &postgres::Database, schema: &str, table: &str) -> Result<bool> {
+    relation_exists(db, schema, table, "r").await
+}
+
+async fn index_exists(db: &postgres::Database, schema: &str, index: &str) -> Result<bool> {
+    relation_exists(db, schema, index, "i").await
+}
+
+#[tokio::test]
+async fn postgres_table_target_reconciles_rows_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres target test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresTargetE2ETest").await?;
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_rows(
+                ctx,
+                schema,
+                vec![
+                    TestRow {
+                        id: 1,
+                        label: "one".to_string(),
+                    },
+                    TestRow {
+                        id: 2,
+                        label: "two".to_string(),
+                    },
+                ],
+            )
+        }
+    })
+    .await?;
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_rows(
+                ctx,
+                schema,
+                vec![
+                    TestRow {
+                        id: 2,
+                        label: "two-updated".to_string(),
+                    },
+                    TestRow {
+                        id: 3,
+                        label: "three".to_string(),
+                    },
+                ],
+            )
+        }
+    })
+    .await?;
+
+    let rows = sqlx::query(&format!(
+        "SELECT id, label FROM \"{schema}\".\"rows\" ORDER BY id"
+    ))
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres query: {e}")))?;
+    let actual = rows
+        .into_iter()
+        .map(|row| {
+            let id: i64 = row.try_get("id").unwrap();
+            let label: String = row.try_get("label").unwrap();
+            (id, label)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![(2, "two-updated".to_string()), (3, "three".to_string())]
+    );
+
+    sqlx::query(&format!("DROP TABLE \"{schema}\".\"rows\""))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres external table drop: {e}")))?;
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_rows(ctx, schema, vec![])
+    })
+    .await?;
+    assert!(
+        table_exists(&db, &schema, "rows").await?,
+        "delete-only reconciliation should recreate a missing table"
+    );
+    let row_count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{schema}\".\"rows\""))
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres count: {e}")))?;
+    assert_eq!(row_count, 0);
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+/// Planned actions as sorted strings. The connector's actions encode as
+/// positional arrays: a table action is `[db_key, spec, drop, recreate,
+/// retype_cols, drop_cols]` with `spec` as `[pg_schema_name, table_name, ..]`, a row
+/// action `[pk, state]`.
+fn describe(actions: &[PreviewAction]) -> Vec<String> {
+    let mut described: Vec<String> = actions
+        .iter()
+        .map(|action| {
+            let (verb, value) = match action {
+                PreviewAction::Create(v) => ("create", v),
+                PreviewAction::Update(v) => ("update", v),
+                PreviewAction::Delete(v) => ("delete", v),
+            };
+            let value: serde_json::Value = value.decode().unwrap();
+            match value.as_array().map(Vec::as_slice) {
+                Some([_db_key, spec, _drop, recreate, retype_cols, _drop_cols]) => format!(
+                    "{verb} table {} recreate={recreate} retype={retype_cols}",
+                    spec[1]
+                ),
+                Some([pk, state]) => format!("{verb} row {pk} {}", state[0]),
+                _ => panic!("unexpected action payload {value}"),
+            }
+        })
+        .collect();
+    described.sort();
+    described
+}
+
+/// Preview plans the table and its rows without creating either.
+#[tokio::test]
+async fn postgres_table_target_previews_rows_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres target test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_preview_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresTargetPreviewTest").await?;
+    let rows = |labels: &[(i64, &str)]| {
+        labels
+            .iter()
+            .map(|(id, label)| TestRow {
+                id: *id,
+                label: label.to_string(),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // The table and both rows would be written (the connector plans every
+    // write as an upsert); nothing is.
+    let actions = app
+        .preview({
+            let schema = schema.clone();
+            let rows = rows(&[(1, "one"), (2, "two")]);
+            move |ctx| declare_rows(ctx, schema, rows)
+        })
+        .await?;
+    assert_eq!(
+        describe(&actions),
+        vec![
+            r#"update row [1] {"id":1,"label":"one"}"#,
+            r#"update row [2] {"id":2,"label":"two"}"#,
+            r#"update table "rows" recreate=false retype=[]"#,
+        ]
+    );
+    assert!(!table_exists(&db, &schema, "rows").await?);
+
+    app.run({
+        let schema = schema.clone();
+        let rows = rows(&[(1, "one"), (2, "two")]);
+        move |ctx| declare_rows(ctx, schema, rows)
+    })
+    .await?;
+
+    // Against the applied state: rows 2 and 3 written; row 1 and the table
+    // unchanged; the container action is still listed. Nothing is applied.
+    let actions = app
+        .preview({
+            let schema = schema.clone();
+            let rows = rows(&[(1, "one"), (2, "two-updated"), (3, "three")]);
+            move |ctx| declare_rows(ctx, schema, rows)
+        })
+        .await?;
+    assert_eq!(
+        describe(&actions),
+        vec![
+            r#"update row [2] {"id":2,"label":"two-updated"}"#,
+            r#"update row [3] {"id":3,"label":"three"}"#,
+            r#"update table "rows" recreate=false retype=[]"#,
+        ]
+    );
+    let row_count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{schema}\".\"rows\""))
+        .fetch_one(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres count: {e}")))?;
+    assert_eq!(row_count, 2);
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_sql_command_attachment_runs_setup_and_teardown_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres SQL-command-attachment test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_sqlcmd_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresSqlCommandE2ETest").await?;
+
+    // Declare the attachment → setup SQL creates the index.
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_rows_with_sql_command(ctx, schema, true)
+    })
+    .await?;
+    assert!(
+        index_exists(&db, &schema, "rows_label_idx").await?,
+        "setup_sql should create the index"
+    );
+
+    // Stop declaring it → teardown SQL drops the index (eager attachment cleanup).
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_rows_with_sql_command(ctx, schema, false)
+    })
+    .await?;
+    assert!(
+        !index_exists(&db, &schema, "rows_label_idx").await?,
+        "teardown_sql should drop the index when the attachment is removed"
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_undeclared_and_dropped_tables_are_removed_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres table-removal test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_removal_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresTableRemovalE2ETest").await?;
+    let row = TestRow {
+        id: 1,
+        label: "one".to_string(),
+    };
+
+    app.run({
+        let schema = schema.clone();
+        let row = row.clone();
+        move |ctx| declare_rows(ctx, schema, vec![row])
+    })
+    .await?;
+    assert!(table_exists(&db, &schema, "rows").await?);
+
+    // A run that no longer declares the table drops it.
+    app.run(|_ctx| async { Ok(()) }).await?;
+    assert!(
+        !table_exists(&db, &schema, "rows").await?,
+        "a table no longer declared is dropped"
+    );
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_rows(ctx, schema, vec![row])
+    })
+    .await?;
+    assert!(table_exists(&db, &schema, "rows").await?);
+
+    app.drop_state().await?;
+    assert!(
+        !table_exists(&db, &schema, "rows").await?,
+        "drop_state drops the table"
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_read_table_items_keys_rows_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres source-items test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let table = format!("src_items_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!(
+        "CREATE TABLE \"{table}\" (id bigint primary key, name text)"
+    ))
+    .execute(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres create source table: {e}")))?;
+    sqlx::query(&format!(
+        "INSERT INTO \"{table}\" (id, name) VALUES (1, 'a'), (2, 'b')"
+    ))
+    .execute(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres insert: {e}")))?;
+
+    #[derive(Deserialize)]
+    struct SrcRow {
+        id: i64,
+        name: String,
+    }
+
+    let mut items: Vec<(cocoindex::StableKey, SrcRow)> =
+        postgres::read_table_items(&db, &table, |row: &SrcRow| row.id)
+            .await?
+            .try_collect()
+            .await?;
+    items.sort_by_key(|(_, row)| row.id);
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].0, cocoindex::StableKey::Int(1));
+    assert_eq!(items[0].1.name, "a");
+    assert_eq!(items[1].0, cocoindex::StableKey::Int(2));
+    assert_eq!(items[1].1.name, "b");
+
+    sqlx::query(&format!("DROP TABLE \"{table}\""))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres drop source table: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_vector_index_target_reconciles_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres vector-index test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_vector_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    if let Err(e) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(db.pool())
+        .await
+    {
+        eprintln!("skipping live Postgres vector-index test; pgvector is unavailable: {e}");
+        return Ok(());
+    }
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresVectorIndexE2ETest").await?;
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_vector_table(ctx, schema, true)
+    })
+    .await?;
+    assert!(table_exists(&db, &schema, "vectors").await?);
+    assert!(index_exists(&db, &schema, "vectors__vector__embedding_idx").await?);
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_vector_table(ctx, schema, false)
+    })
+    .await?;
+    assert!(
+        !index_exists(&db, &schema, "vectors__vector__embedding_idx").await?,
+        "undeclared vector index should be dropped"
+    );
+    assert!(table_exists(&db, &schema, "vectors").await?);
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_strips_nul_from_text_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres NUL test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_nul_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresNulE2ETest").await?;
+
+    // A label containing a U+0000 NUL — Postgres `text` cannot store it, so it
+    // must be stripped before insert (otherwise the write errors).
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_rows(
+                ctx,
+                schema,
+                vec![TestRow {
+                    id: 1,
+                    label: "a\u{0}b".to_string(),
+                }],
+            )
+        }
+    })
+    .await?;
+
+    let label: String = sqlx::query_scalar(&format!(
+        "SELECT label FROM \"{schema}\".\"rows\" WHERE id = 1"
+    ))
+    .fetch_one(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres query: {e}")))?;
+    assert_eq!(label, "ab", "NUL should be stripped from the stored text");
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+async fn declare_cols(
+    ctx: Ctx,
+    schema_ns: String,
+    columns: Vec<(String, String)>,
+    row: serde_json::Value,
+) -> Result<()> {
+    let cols: Vec<(String, postgres::ColumnDef)> = columns
+        .into_iter()
+        .map(|(n, t)| (n, postgres::ColumnDef::new(t)))
+        .collect();
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "rows",
+        postgres::TableSchema::new(cols, ["id"])?,
+        Some(&schema_ns),
+    )
+    .await?;
+    table.declare_row(&ctx, &row)?;
+    Ok(())
+}
+
+async fn column_exists(
+    db: &postgres::Database,
+    schema: &str,
+    table: &str,
+    col: &str,
+) -> Result<bool> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = $2 AND column_name = $3",
+    )
+    .bind(schema)
+    .bind(table)
+    .bind(col)
+    .fetch_one(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres column lookup: {e}")))?;
+    Ok(count > 0)
+}
+
+fn cols(names: &[(&str, &str)]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect()
+}
+
+#[tokio::test]
+async fn postgres_adds_and_drops_columns_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres schema-evolution test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_evolve_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    let (app, _tempdir) = build_app(&db, "PostgresEvolveE2ETest").await?;
+
+    // v1: (id, label)
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_cols(
+                ctx,
+                schema,
+                cols(&[("id", "bigint"), ("label", "text")]),
+                serde_json::json!({ "id": 1, "label": "a" }),
+            )
+        }
+    })
+    .await?;
+    assert!(!column_exists(&db, &schema, "rows", "extra").await?);
+
+    // v2: add the `extra` column.
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_cols(
+                ctx,
+                schema,
+                cols(&[("id", "bigint"), ("label", "text"), ("extra", "text")]),
+                serde_json::json!({ "id": 1, "label": "a", "extra": "x" }),
+            )
+        }
+    })
+    .await?;
+    assert!(column_exists(&db, &schema, "rows", "extra").await?);
+    let extra: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT extra FROM \"{schema}\".\"rows\" WHERE id = 1"
+    ))
+    .fetch_one(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres query: {e}")))?;
+    assert_eq!(extra.as_deref(), Some("x"));
+
+    // v3: drop the `extra` column.
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_cols(
+                ctx,
+                schema,
+                cols(&[("id", "bigint"), ("label", "text")]),
+                serde_json::json!({ "id": 1, "label": "a" }),
+            )
+        }
+    })
+    .await?;
+    assert!(!column_exists(&db, &schema, "rows", "extra").await?);
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_column_drop_retries_after_failed_attempt_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres column-drop-retry test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_dropretry_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    let (app, _tempdir) = build_app(&db, "PostgresDropRetryE2ETest").await?;
+
+    // v1: table with (id, label, extra).
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_cols(
+                ctx,
+                schema,
+                cols(&[("id", "bigint"), ("label", "text"), ("extra", "text")]),
+                serde_json::json!({ "id": 1, "label": "a", "extra": "x" }),
+            )
+        }
+    })
+    .await?;
+
+    // A view that depends on `extra` — this blocks DROP COLUMN.
+    sqlx::query(&format!(
+        "CREATE VIEW \"{schema}\".\"dep\" AS SELECT id, extra FROM \"{schema}\".\"rows\""
+    ))
+    .execute(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres create view: {e}")))?;
+
+    // v2: drop `extra` — fails because the view depends on it.
+    let failed = app
+        .run({
+            let schema = schema.clone();
+            move |ctx| {
+                declare_cols(
+                    ctx,
+                    schema,
+                    cols(&[("id", "bigint"), ("label", "text")]),
+                    serde_json::json!({ "id": 1, "label": "a" }),
+                )
+            }
+        })
+        .await;
+    assert!(
+        failed.is_err(),
+        "DROP COLUMN blocked by a view should error"
+    );
+    assert!(
+        column_exists(&db, &schema, "rows", "extra").await?,
+        "the column must still exist after the failed drop"
+    );
+
+    // Remove the dependency, then retry — the drop now succeeds.
+    sqlx::query(&format!("DROP VIEW \"{schema}\".\"dep\""))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres drop view: {e}")))?;
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_cols(
+                ctx,
+                schema,
+                cols(&[("id", "bigint"), ("label", "text")]),
+                serde_json::json!({ "id": 1, "label": "a" }),
+            )
+        }
+    })
+    .await?;
+    assert!(
+        !column_exists(&db, &schema, "rows", "extra").await?,
+        "retry after removing the dependency should drop the column"
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+struct BlobRow {
+    id: i64,
+    data: Vec<u8>,
+}
+
+async fn declare_blobs(ctx: Ctx, schema: String, rows: Vec<BlobRow>) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "blobs",
+        postgres::TableSchema::new(
+            [
+                ("id", postgres::ColumnDef::new("bigint")),
+                ("data", postgres::ColumnDef::new("bytea")),
+            ],
+            ["id"],
+        )?,
+        Some(&schema),
+    )
+    .await?;
+    for row in &rows {
+        table.declare_row(&ctx, row)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_bytea_round_trips_byte_arrays_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres bytea test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_bytea_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresByteaTest").await?;
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_blobs(
+                ctx,
+                schema,
+                vec![
+                    BlobRow {
+                        id: 1,
+                        data: vec![0u8, 1, 2, 255, 104, 105],
+                    },
+                    BlobRow {
+                        id: 2,
+                        data: Vec::new(),
+                    },
+                ],
+            )
+        }
+    })
+    .await?;
+
+    let rows = sqlx::query(&format!(
+        "SELECT id, data FROM \"{schema}\".\"blobs\" ORDER BY id"
+    ))
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres query: {e}")))?;
+    let actual = rows
+        .into_iter()
+        .map(|row| {
+            let id: i64 = row.try_get("id").unwrap();
+            let data: Vec<u8> = row.try_get("data").unwrap();
+            (id, data)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        vec![(1, vec![0u8, 1, 2, 255, 104, 105]), (2, Vec::new())],
+        "bytea byte arrays must round-trip exactly (hex-encoded literal)"
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[derive(Clone, Serialize, SchemaFields)]
+struct DecimalRow {
+    id: i64,
+    amount: Decimal,
+    elapsed: Duration,
+}
+
+async fn declare_decimals(ctx: Ctx, schema: String, rows: Vec<DecimalRow>) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "decimals",
+        postgres::TableSchema::from_row::<DecimalRow>(["id"])?,
+        Some(&schema),
+    )
+    .await?;
+    for row in &rows {
+        table.declare_row(&ctx, row)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_decimal_and_duration_round_trip_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres decimal test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_decimal_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    let (app, _tempdir) = build_app(&db, "PostgresDecimalTest").await?;
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_decimals(
+                ctx,
+                schema,
+                vec![DecimalRow {
+                    id: 1,
+                    amount: Decimal::from_str("1234567890.012300").unwrap(),
+                    elapsed: Duration::new(2, 345_678_000),
+                }],
+            )
+        }
+    })
+    .await?;
+
+    let row = sqlx::query(&format!(
+        "SELECT amount::text AS amount, EXTRACT(EPOCH FROM elapsed)::double precision AS elapsed \
+         FROM \"{schema}\".\"decimals\" WHERE id = 1"
+    ))
+    .fetch_one(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres query: {e}")))?;
+    assert_eq!(
+        row.try_get::<String, _>("amount").unwrap(),
+        "1234567890.012300"
+    );
+    assert_eq!(row.try_get::<f64, _>("elapsed").unwrap(), 2.345678);
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+async fn declare_evo_table(
+    ctx: Ctx,
+    schema: String,
+    cols: Vec<(&'static str, &'static str)>,
+    pk: Vec<&'static str>,
+    rows: Vec<serde_json::Value>,
+) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "evo",
+        postgres::TableSchema::new(
+            cols.into_iter()
+                .map(|(n, t)| (n.to_string(), postgres::ColumnDef::new(t))),
+            pk.into_iter().map(|s| s.to_string()),
+        )?,
+        Some(&schema),
+    )
+    .await?;
+    for r in &rows {
+        table.declare_row(&ctx, r)?;
+    }
+    Ok(())
+}
+
+async fn pg_col_type(db: &postgres::Database, schema: &str, col: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_schema = $1 AND table_name = 'evo' AND column_name = $2",
+    )
+    .bind(schema)
+    .bind(col)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn postgres_schema_evolution_retype_and_pk_change_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres schema-evolution test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_evo_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresEvoTest").await?;
+
+    // v1: score is bigint.
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_evo_table(
+                ctx,
+                schema,
+                vec![("id", "bigint"), ("name", "text"), ("score", "bigint")],
+                vec!["id"],
+                vec![
+                    serde_json::json!({"id": 1, "name": "a", "score": 10}),
+                    serde_json::json!({"id": 2, "name": "b", "score": 20}),
+                ],
+            )
+        }
+    })
+    .await?;
+    assert_eq!(
+        pg_col_type(&db, &schema, "score").await.as_deref(),
+        Some("bigint")
+    );
+
+    // v2: retype score bigint -> double precision (in-place ALTER, rows preserved).
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_evo_table(
+                ctx,
+                schema,
+                vec![
+                    ("id", "bigint"),
+                    ("name", "text"),
+                    ("score", "double precision"),
+                ],
+                vec!["id"],
+                vec![
+                    serde_json::json!({"id": 1, "name": "a", "score": 10.0}),
+                    serde_json::json!({"id": 2, "name": "b", "score": 20.0}),
+                ],
+            )
+        }
+    })
+    .await?;
+    assert_eq!(
+        pg_col_type(&db, &schema, "score").await.as_deref(),
+        Some("double precision"),
+        "score column should be retyped in place"
+    );
+    let scores: Vec<f64> = sqlx::query_scalar(&format!(
+        "SELECT score FROM \"{schema}\".\"evo\" ORDER BY id"
+    ))
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(scores, vec![10.0, 20.0], "retype must preserve row data");
+
+    // v3: change the primary key id -> name. This forces a destructive recreate;
+    // rows are replayed via the Destructive child invalidation.
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_evo_table(
+                ctx,
+                schema,
+                vec![
+                    ("id", "bigint"),
+                    ("name", "text"),
+                    ("score", "double precision"),
+                ],
+                vec!["name"],
+                vec![
+                    serde_json::json!({"id": 1, "name": "a", "score": 10.0}),
+                    serde_json::json!({"id": 2, "name": "b", "score": 20.0}),
+                ],
+            )
+        }
+    })
+    .await?;
+    // The PK is now `name` (table was dropped + recreated), and rows are present.
+    let pk_col: Option<String> = sqlx::query_scalar(
+        "SELECT a.attname FROM pg_index i \
+         JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) \
+         WHERE i.indrelid = ($1 || '.evo')::regclass AND i.indisprimary",
+    )
+    .bind(&schema)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        pk_col.as_deref(),
+        Some("name"),
+        "primary key should now be `name`"
+    );
+    let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{schema}\".\"evo\""))
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "rows should be replayed after the destructive recreate"
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Derived-schema overrides: the embedder supplies the vector schema.
+// ---------------------------------------------------------------------------
+
+cocoindex::context_key!(
+    static EMBEDDER: cocoindex::VectorSchema, key = "postgres_target_test_embedder"
+);
+
+#[derive(Clone, Serialize, SchemaFields)]
+struct ProviderRow {
+    id: i64,
+    title: String,
+    #[coco(vector)]
+    embedding: Vec<f32>,
+}
+
+/// `with_vector_schema` takes the dimension and the pgvector type from the
+/// provider held in the context, and `with_column_type` replaces one derived
+/// column type; both reach the created table.
+#[tokio::test]
+async fn postgres_from_row_resolves_vector_from_context_provider_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres provider-schema test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_provider_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    if let Err(e) = sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
+        .execute(db.pool())
+        .await
+    {
+        eprintln!("skipping live Postgres provider-schema test; pgvector is unavailable: {e}");
+        return Ok(());
+    }
+
+    let tempdir = tempfile::tempdir().unwrap();
+    let app = Environment::builder()
+        .db_path(tempdir.path().join(".cocoindex_db"))
+        .provide_key(&PG, db.clone())
+        .provide_key(
+            &EMBEDDER,
+            cocoindex::VectorSchema {
+                element_type: cocoindex::VectorElementType::Float16,
+                size: 3,
+            },
+        )
+        .build()
+        .await?
+        .app("PostgresProviderSchemaE2ETest")
+        .await?;
+
+    app.run({
+        let schema = schema.clone();
+        move |ctx| async move {
+            let table_schema = postgres::TableSchema::from_row::<ProviderRow>(["id"])?
+                .with_vector_schema("embedding", ctx.get_key(&EMBEDDER)?)
+                .await?
+                .with_column_type("title", "varchar(40)")?;
+            let table =
+                postgres::mount_table_target(&ctx, &PG, "docs", table_schema, Some(&schema))
+                    .await?;
+            table.declare_row(
+                &ctx,
+                &ProviderRow {
+                    id: 1,
+                    title: "first".to_string(),
+                    embedding: vec![0.0, 1.0, 0.0],
+                },
+            )?;
+            Ok(())
+        }
+    })
+    .await?;
+
+    let types: Vec<(String, String)> = sqlx::query_as(
+        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
+         FROM pg_attribute a \
+         WHERE a.attrelid = format('%I.%I', $1::text, 'docs')::regclass \
+           AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attname",
+    )
+    .bind(&schema)
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres column types: {e}")))?;
+    assert_eq!(
+        types,
+        vec![
+            ("embedding".to_string(), "halfvec(3)".to_string()),
+            ("id".to_string(), "bigint".to_string()),
+            ("title".to_string(), "character varying(40)".to_string()),
+        ]
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_applies_a_batch_in_chunked_statements_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres batch test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_batch_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresBatchE2ETest").await?;
+
+    // 4,500 rows: three upsert statements of at most 2,000 rows, not one
+    // statement per row.
+    let rows: Vec<TestRow> = (1..=4500)
+        .map(|id| TestRow {
+            id,
+            label: format!("label {id}"),
+        })
+        .collect();
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_rows(ctx, schema, rows)
+    })
+    .await?;
+    let table = format!("\"{schema}\".\"rows\"");
+    let inserts = common::sql_statements_containing(&format!("INSERT INTO {table}"));
+    assert_eq!(inserts.len(), 3, "{}", inserts.len());
+    assert!(
+        inserts
+            .iter()
+            .all(|s| s.contains("unnest($1::text[], $2::text[])")),
+        "{}",
+        inserts[0]
+    );
+    let (count, last): (i64, String) =
+        sqlx::query_as(&format!("SELECT count(*), max(label) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .map_err(|e| cocoindex::Error::engine(format!("postgres count: {e}")))?;
+    assert_eq!((count, last.as_str()), (4500, "label 999"));
+
+    // Keep 100 rows (updated): 4,400 deletes in three statements, 100
+    // upserts in one.
+    let kept: Vec<TestRow> = (1..=100)
+        .map(|id| TestRow {
+            id,
+            label: format!("kept {id}"),
+        })
+        .collect();
+    app.run({
+        let schema = schema.clone();
+        move |ctx| declare_rows(ctx, schema, kept)
+    })
+    .await?;
+    let deletes = common::sql_statements_containing(&format!("DELETE FROM {table}"));
+    assert_eq!(deletes.len(), 3, "{}", deletes.len());
+    let inserts = common::sql_statements_containing(&format!("INSERT INTO {table}"));
+    assert_eq!(inserts.len(), 4, "{}", inserts.len());
+    let (count, last): (i64, String) =
+        sqlx::query_as(&format!("SELECT count(*), max(label) FROM {table}"))
+            .fetch_one(db.pool())
+            .await
+            .map_err(|e| cocoindex::Error::engine(format!("postgres count: {e}")))?;
+    assert_eq!((count, last.as_str()), (100, "kept 99"));
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+#[derive(Clone, Serialize)]
+struct AddressRow {
+    id: i64,
+    host: std::net::IpAddr,
+    network: Option<String>,
+}
+
+async fn declare_addresses(ctx: Ctx, schema: String, rows: Vec<AddressRow>) -> Result<()> {
+    let table = postgres::mount_table_target(
+        &ctx,
+        &PG,
+        "addresses",
+        postgres::TableSchema::new(
+            [
+                ("id", postgres::ColumnDef::new("bigint")),
+                ("host", postgres::ColumnDef::new("inet")),
+                ("network", postgres::ColumnDef::new("cidr").nullable()),
+            ],
+            ["id"],
+        )?,
+        Some(&schema),
+    )
+    .await?;
+    for row in &rows {
+        table.declare_row(&ctx, row)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn postgres_inet_and_cidr_columns_round_trip_when_available() -> Result<()> {
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres inet test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_inet_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresInetE2ETest").await?;
+    app.run({
+        let schema = schema.clone();
+        move |ctx| {
+            declare_addresses(
+                ctx,
+                schema,
+                vec![
+                    AddressRow {
+                        id: 1,
+                        host: "10.1.2.3".parse().unwrap(),
+                        network: Some("10.0.0.0/8".to_string()),
+                    },
+                    AddressRow {
+                        id: 2,
+                        host: "2001:db8::1".parse().unwrap(),
+                        network: None,
+                    },
+                ],
+            )
+        }
+    })
+    .await?;
+    let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(&format!(
+        "SELECT id, host(host), network::text FROM \"{schema}\".\"addresses\" ORDER BY id"
+    ))
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| cocoindex::Error::engine(format!("postgres select: {e}")))?;
+    assert_eq!(
+        rows,
+        vec![
+            (1, "10.1.2.3".to_string(), Some("10.0.0.0/8".to_string())),
+            (2, "2001:db8::1".to_string(), None),
+        ]
+    );
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(|e| cocoindex::Error::engine(format!("postgres cleanup: {e}")))?;
+    Ok(())
+}
+
+async fn declare_rows_user_managed(ctx: Ctx, schema: String, rows: Vec<TestRow>) -> Result<()> {
+    // The pending form's row provider resolves when the declaring component
+    // commits (Python declares the table through `use_mount`): the table is
+    // declared in one child, and the rows in a sibling mounted once that child
+    // is ready.
+    let declared: Arc<std::sync::Mutex<Option<postgres::TableTarget>>> = Arc::default();
+    let handle = ctx
+        .mount(&"table", {
+            let declared = declared.clone();
+            move |child| async move {
+                let table = postgres::declare_table_target_with_options(
+                    &child,
+                    &PG,
+                    "user_rows",
+                    postgres::TableSchema::new(
+                        [
+                            ("id", postgres::ColumnDef::new("bigint")),
+                            ("label", postgres::ColumnDef::new("text")),
+                        ],
+                        ["id"],
+                    )?,
+                    Some(&schema),
+                    cocoindex::ManagedTargetOptions {
+                        managed_by: cocoindex::ManagedBy::User,
+                    },
+                )?;
+                *declared.lock().unwrap() = Some(table);
+                Ok(())
+            }
+        })
+        .await?;
+    handle.ready().await?;
+    let table = declared.lock().unwrap().take().expect("table declared");
+    ctx.mount(&"rows", move |child| async move {
+        for row in &rows {
+            table.declare_row(&child, row)?;
+        }
+        Ok(())
+    })
+    .await?
+    .ready()
+    .await
+}
+
+#[tokio::test]
+async fn postgres_declared_user_managed_table_keeps_table_manages_rows_when_available() -> Result<()>
+{
+    let Ok(url) = std::env::var("POSTGRES_URL") else {
+        eprintln!("skipping live Postgres user-managed test; POSTGRES_URL is not set");
+        return Ok(());
+    };
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("cocoindex_rust_user_managed_test_{nonce}");
+    let db = postgres::Database::connect(&url).await?;
+    let pe = |e: sqlx::Error| cocoindex::Error::engine(format!("postgres: {e}"));
+    // The user owns the table: it exists before the first run.
+    sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(db.pool())
+        .await
+        .map_err(pe)?;
+    sqlx::query(&format!(
+        "CREATE TABLE \"{schema}\".\"user_rows\" (id bigint PRIMARY KEY, label text NOT NULL)"
+    ))
+    .execute(db.pool())
+    .await
+    .map_err(pe)?;
+
+    let (app, _tempdir) = build_app(&db, "PostgresUserManagedE2ETest").await?;
+    let row = TestRow {
+        id: 1,
+        label: "one".to_string(),
+    };
+    app.run({
+        let schema = schema.clone();
+        let row = row.clone();
+        move |ctx| declare_rows_user_managed(ctx, schema, vec![row])
+    })
+    .await?;
+    let labels: Vec<String> =
+        sqlx::query_scalar(&format!("SELECT label FROM \"{schema}\".\"user_rows\""))
+            .fetch_all(db.pool())
+            .await
+            .map_err(pe)?;
+    assert_eq!(labels, vec!["one".to_string()]);
+
+    // A run that no longer declares the table leaves it in place: the user
+    // owns it.
+    app.run(|_ctx| async { Ok(()) }).await?;
+    assert!(table_exists(&db, &schema, "user_rows").await?);
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+        .execute(db.pool())
+        .await
+        .map_err(pe)?;
+    Ok(())
+}

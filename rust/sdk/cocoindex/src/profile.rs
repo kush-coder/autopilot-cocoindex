@@ -1,0 +1,466 @@
+//! Sealed `RustProfile` implementing `EngineProfile`.
+//! All types here are `pub(crate)` — users never see this module.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use cocoindex_core::engine::component::{ComponentProcessor, ComponentProcessorInfo};
+use cocoindex_core::engine::context::{
+    ComponentProcessorContext, DataDepRecord, MemoStatesPayload,
+};
+use cocoindex_core::engine::profile::{DataDepsValidation, EngineProfile, Persist};
+use cocoindex_core::engine::target_state::{
+    ChildHandling, TargetActionSink, TargetActionWithChildSlot, TargetHandler,
+    TargetReconcileOutput,
+};
+use cocoindex_core::state::stable_path::{StableKey, StablePath};
+use cocoindex_utils::fingerprint::Fingerprint;
+use serde::{Deserialize, Serialize};
+
+use crate::ctx::ContextStore;
+use crate::deps::validate_data_deps;
+use crate::error::{Error, Result};
+use crate::memo::{MemoInput, collect_component_states};
+
+// ---------------------------------------------------------------------------
+// RustProfile — the sealed EngineProfile implementation
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub(crate) struct RustProfile;
+
+impl EngineProfile for RustProfile {
+    type HostRuntimeCtx = ();
+    /// The environment's context store, so target sinks can resolve provided
+    /// resources (pools/clients) by their stable key at apply time (§10/§11).
+    type HostCtx = ContextStore;
+    type ComponentProc = BoxedProcessor;
+    type FunctionData = Value;
+
+    type TargetHdl = BoxedHandler;
+    type TargetStateTrackingRecord = Value;
+    type TargetAction = Action;
+    type TargetActionSink = BoxedSink;
+    type TargetStateValue = Value;
+
+    /// A memoized ancestor's probe validates the open descendants its memo
+    /// lists from their stored rows before reusing it, while none of them is
+    /// mounted: there is no processor and no `Ctx` for the row at `path`, only
+    /// its records, validated through the registered [`crate::DataDep`] kinds.
+    fn validate_data_deps(
+        _host_runtime_ctx: &(),
+        path: &StablePath,
+        records: Vec<DataDepRecord>,
+    ) -> cocoindex_utils::error::Result<
+        impl Future<Output = cocoindex_utils::error::Result<DataDepsValidation>> + Send + 'static,
+    > {
+        let where_ = format!("component {path}");
+        Ok(async move {
+            let outcome = validate_data_deps(records, &where_)
+                .await
+                .map_err(Error::into_core)?;
+            Ok(DataDepsValidation {
+                records: outcome.records,
+                can_reuse: outcome.can_reuse,
+                states_changed: outcome.states_changed,
+            })
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value — MessagePack-serialized bytes. Implements Persist.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub(crate) struct Value(pub(crate) bytes::Bytes);
+
+impl Value {
+    pub(crate) fn from_serializable<T: Serialize>(data: &T) -> Result<Self> {
+        let encoded = rmp_serde::to_vec(data)?;
+        Ok(Self(bytes::Bytes::from(encoded)))
+    }
+
+    pub(crate) fn deserialize<T: for<'de> Deserialize<'de>>(&self) -> Result<T> {
+        let val = rmp_serde::from_slice(&self.0)?;
+        Ok(val)
+    }
+
+    /// Create a "unit" value (empty tuple).
+    pub(crate) fn unit() -> Self {
+        Self::from_serializable(&()).expect("unit serialization cannot fail")
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Value({} bytes)", self.0.len())
+    }
+}
+
+impl Persist for Value {
+    fn to_bytes(&self) -> cocoindex_utils::error::Result<bytes::Bytes> {
+        Ok(self.0.clone())
+    }
+
+    fn from_bytes(data: &[u8]) -> cocoindex_utils::error::Result<Self> {
+        Ok(Self(bytes::Bytes::copy_from_slice(data)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BoxedProcessor — Type-erased component processor wrapping user closures.
+// ---------------------------------------------------------------------------
+
+/// Closure that receives the engine-provided `ComponentProcessorContext` and
+/// returns a future producing a `Value`.
+type ProcessFn = Box<
+    dyn FnOnce(
+            ComponentProcessorContext<RustProfile>,
+        ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>
+        + Send
+        + 'static,
+>;
+
+pub(crate) struct BoxedProcessor {
+    process_fn: std::sync::Mutex<Option<ProcessFn>>,
+    memo_fp: Option<Fingerprint>,
+    /// Whether context values with memo state functions may be read, so a
+    /// miss has initial context states to collect.
+    has_context_memo_state: bool,
+    /// Mount arguments whose memo states gate a component-memo hit.
+    state_inputs: Vec<Arc<dyn MemoInput>>,
+    info: Arc<ComponentProcessorInfo>,
+}
+
+impl BoxedProcessor {
+    pub(crate) fn new(
+        process_fn: impl FnOnce(
+            ComponentProcessorContext<RustProfile>,
+        )
+            -> Pin<Box<dyn Future<Output = Result<Value>> + Send + 'static>>
+        + Send
+        + 'static,
+        memo_fp: Option<Fingerprint>,
+        name: String,
+    ) -> Self {
+        Self {
+            process_fn: std::sync::Mutex::new(Some(Box::new(process_fn))),
+            memo_fp,
+            has_context_memo_state: false,
+            state_inputs: Vec::new(),
+            info: Arc::new(ComponentProcessorInfo::new(name)),
+        }
+    }
+
+    pub(crate) fn with_context_memo_state(mut self, enabled: bool) -> Self {
+        self.has_context_memo_state = enabled;
+        self
+    }
+
+    pub(crate) fn with_state_inputs(mut self, state_inputs: Vec<Arc<dyn MemoInput>>) -> Self {
+        self.state_inputs = state_inputs;
+        self
+    }
+}
+
+impl ComponentProcessor<RustProfile> for BoxedProcessor {
+    fn process(
+        &self,
+        _host_runtime_ctx: &(),
+        comp_ctx: &ComponentProcessorContext<RustProfile>,
+    ) -> cocoindex_utils::error::Result<
+        impl Future<Output = cocoindex_utils::error::Result<Value>> + Send + 'static,
+    > {
+        let process_fn = self
+            .process_fn
+            .lock()
+            .map_err(|_| cocoindex_utils::error::Error::internal_msg("processor state poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                cocoindex_utils::error::Error::internal_msg("processor already consumed")
+            })?;
+        let fut = process_fn(comp_ctx.clone());
+        Ok(async move { fut.await.map_err(crate::error::Error::into_core) })
+    }
+
+    fn memo_key_fingerprint(&self) -> Option<Fingerprint> {
+        self.memo_fp
+    }
+
+    /// Always: a stored entry may hold data dependencies (`use_data_dep`) to
+    /// validate even when no argument or context value carries state.
+    fn has_memo_state_handler(&self) -> bool {
+        true
+    }
+
+    fn collects_initial_states(&self) -> bool {
+        self.has_context_memo_state || !self.state_inputs.is_empty()
+    }
+
+    fn handle_memo_states(
+        &self,
+        _host_runtime_ctx: &(),
+        comp_ctx: &ComponentProcessorContext<RustProfile>,
+        stored_states: Option<MemoStatesPayload<RustProfile>>,
+    ) -> cocoindex_utils::error::Result<
+        impl Future<
+            Output = cocoindex_utils::error::Result<(MemoStatesPayload<RustProfile>, bool, bool)>,
+        > + Send
+        + 'static,
+    > {
+        let context = Arc::clone(comp_ctx.host_ctx());
+        let state_inputs = self.state_inputs.clone();
+        let where_ = format!("component {}", comp_ctx.stable_path());
+        let initial_context_states = stored_states
+            .is_none()
+            .then(|| comp_ctx.collect_context_initial_states());
+        let stored_states = stored_states.unwrap_or_default();
+        Ok(async move {
+            let Some(initial_context_states) = initial_context_states else {
+                let (positional, positional_valid) =
+                    collect_component_states(&state_inputs, Some(&stored_states.positional))
+                        .await
+                        .map_err(Error::into_core)?;
+                let positional_changed = positional.len() != stored_states.positional.len()
+                    || positional
+                        .iter()
+                        .zip(&stored_states.positional)
+                        .any(|(new, old)| new.0 != old.0);
+                let validation = context
+                    .validate_memo_states(&stored_states.by_context_fp)
+                    .await
+                    .map_err(Error::into_core)?;
+                let mut can_reuse = positional_valid && validation.memo_valid;
+                let mut states_changed = positional_changed || validation.states_changed;
+                // The component's own data dependencies (`use_data_dep`),
+                // validated only when the states still allow a reuse.
+                let data_deps = if can_reuse && !stored_states.data_deps.is_empty() {
+                    let outcome = validate_data_deps(stored_states.data_deps, &where_)
+                        .await
+                        .map_err(Error::into_core)?;
+                    can_reuse &= outcome.can_reuse;
+                    states_changed |= outcome.states_changed;
+                    outcome.records
+                } else {
+                    Vec::new()
+                };
+                return Ok((
+                    MemoStatesPayload {
+                        positional,
+                        by_context_fp: validation.states,
+                        data_deps,
+                    },
+                    can_reuse,
+                    states_changed,
+                ));
+            };
+            let (positional, _) = collect_component_states(&state_inputs, None)
+                .await
+                .map_err(Error::into_core)?;
+            Ok((
+                MemoStatesPayload {
+                    positional,
+                    by_context_fp: initial_context_states,
+                    data_deps: Vec::new(),
+                },
+                true,
+                false,
+            ))
+        })
+    }
+
+    fn processor_info(&self) -> &ComponentProcessorInfo {
+        &self.info
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Action — Reconciliation action.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub(crate) enum Action {
+    Create(Value),
+    Update(Value),
+    Delete(Value),
+}
+
+// ---------------------------------------------------------------------------
+// BoxedHandler — Type-erased target handler for reconciliation.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct BoxedHandler {
+    reconcile_fn: Arc<ReconcileFn>,
+    attachments_fn: Arc<AttachmentsFn>,
+}
+
+type ReconcileFn = dyn Fn(
+        StableKey,
+        Option<&Value>,
+        &[Value],
+        bool,
+    ) -> cocoindex_utils::error::Result<Option<TargetReconcileOutput<RustProfile>>>
+    + Send
+    + Sync;
+
+type AttachmentsFn =
+    dyn Fn() -> cocoindex_utils::error::Result<Vec<(Arc<str>, BoxedHandler)>> + Send + Sync;
+
+impl BoxedHandler {
+    pub(crate) fn new(
+        f: impl Fn(
+            StableKey,
+            Option<&Value>,
+            &[Value],
+            bool,
+        )
+            -> cocoindex_utils::error::Result<Option<TargetReconcileOutput<RustProfile>>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self {
+            reconcile_fn: Arc::new(f),
+            attachments_fn: Arc::new(|| Ok(vec![])),
+        }
+    }
+
+    pub(crate) fn with_attachments(
+        mut self,
+        f: impl Fn() -> cocoindex_utils::error::Result<Vec<(Arc<str>, BoxedHandler)>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.attachments_fn = Arc::new(f);
+        self
+    }
+}
+
+impl TargetHandler<RustProfile> for BoxedHandler {
+    fn reconcile(
+        &self,
+        key: StableKey,
+        desired_target_state: Option<&Value>,
+        prev_possible_states: &[Value],
+        prev_may_be_missing: bool,
+    ) -> cocoindex_utils::error::Result<Option<TargetReconcileOutput<RustProfile>>> {
+        (self.reconcile_fn)(
+            key,
+            desired_target_state,
+            prev_possible_states,
+            prev_may_be_missing,
+        )
+    }
+
+    fn attachments(&self) -> cocoindex_utils::error::Result<Vec<(Arc<str>, BoxedHandler)>> {
+        (self.attachments_fn)()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BoxedSink — Type-erased action sink for batched target state application.
+// ---------------------------------------------------------------------------
+
+pub(crate) type SinkFuture =
+    Pin<Box<dyn Future<Output = cocoindex_utils::error::Result<()>> + Send>>;
+
+// The sink receives the host context (the environment's `ContextStore`) so it
+// can resolve provided resources (pools/clients) by their stable key at apply
+// time, and each action paired with the slot for its child target provider
+// (`None` for leaf actions). The typed constructors on
+// `target_state::TargetActionSink` decode both for connector code.
+type SinkFn = Arc<
+    dyn Fn(Arc<ContextStore>, Vec<TargetActionWithChildSlot<RustProfile>>) -> SinkFuture
+        + Send
+        + Sync,
+>;
+
+// A container sink's child handler factory: the handler for the child target
+// states of one create/update action, built from the action alone.
+pub(crate) type ChildHandlerFn =
+    Arc<dyn Fn(&Action) -> cocoindex_utils::error::Result<BoxedHandler> + Send + Sync>;
+
+/// How a [`BoxedSink`] provides child handlers (see [`ChildHandling`]).
+pub(crate) enum SinkChildren {
+    Leaf,
+    LegacySlots,
+    Factory(ChildHandlerFn),
+}
+
+pub(crate) struct BoxedSink {
+    apply_fn: SinkFn,
+    children: SinkChildren,
+}
+
+impl BoxedSink {
+    pub(crate) fn new(
+        f: impl Fn(Arc<ContextStore>, Vec<TargetActionWithChildSlot<RustProfile>>) -> SinkFuture
+        + Send
+        + Sync
+        + 'static,
+        children: SinkChildren,
+    ) -> Self {
+        Self {
+            apply_fn: Arc::new(f),
+            children,
+        }
+    }
+}
+
+#[async_trait]
+impl TargetActionSink<RustProfile> for BoxedSink {
+    fn child_handling(&self) -> ChildHandling {
+        match self.children {
+            SinkChildren::Leaf => ChildHandling::Leaf,
+            SinkChildren::LegacySlots => ChildHandling::LegacySlots,
+            SinkChildren::Factory(_) => ChildHandling::Factory,
+        }
+    }
+
+    async fn child_handlers(
+        &self,
+        _host_runtime_ctx: &(),
+        _host_ctx: Arc<ContextStore>,
+        actions: &[&Action],
+    ) -> cocoindex_utils::error::Result<Vec<BoxedHandler>> {
+        let SinkChildren::Factory(child_handler) = &self.children else {
+            cocoindex_utils::internal_bail!("target action sink has no child handler factory");
+        };
+        actions.iter().map(|action| child_handler(action)).collect()
+    }
+
+    async fn apply(
+        &self,
+        _host_runtime_ctx: &(),
+        host_ctx: Arc<ContextStore>,
+        actions: &[TargetActionWithChildSlot<RustProfile>],
+    ) -> cocoindex_utils::error::Result<()> {
+        // The engine keeps the actions to retry subsets of a failed batch; an
+        // `Action` wraps `Bytes` and a slot is an `Arc`, so this is a refcount
+        // bump per action.
+        (self.apply_fn)(host_ctx, actions.to_vec()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_roundtrip() {
+        let original = vec![1u32, 2, 3];
+        let v = Value::from_serializable(&original).unwrap();
+        let restored: Vec<u32> = v.deserialize().unwrap();
+        assert_eq!(original, restored);
+    }
+
+    #[test]
+    fn value_unit() {
+        let v = Value::unit();
+        let _: () = v.deserialize().unwrap();
+    }
+}
